@@ -1,0 +1,15 @@
+{
+  "name": "spellbound-chess",
+  "version": "1.0.0",
+  "description": "Chess with magic cards every 5 turns. Room-based online play.",
+  "main": "server/index.js",
+  "scripts": {
+    "start": "node server/index.js",
+    "online": "node server/index.js --tunnel",
+    "test": "node test/engine.test.js"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "socket.io": "^4.8.0"
+  }
+}
