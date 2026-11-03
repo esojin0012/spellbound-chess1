@@ -20,6 +20,7 @@
     token = Math.random().toString(36).slice(2) + Date.now().toString(36);
     sessionStorage.setItem('sbc_token', token);
   }
+  let currentUser = null;
 
   let S = null; // latest state from server
   let userFlip = false;
@@ -28,7 +29,6 @@
   let lastEffectsId = null;
   let lastShotgunId = null;
   let lastNoticeId = null;
-  let lastFourDimUnmergeId = null;
   let eventHorizonPendingCut = false;
   let lastMoveCount = 0;
   let lastResultKey = null;
@@ -83,8 +83,6 @@
     } catch { /* ignore */ }
     return actx;
   }
-  window.addEventListener('pointerdown', ensureAudioContext, { passive: true });
-  window.addEventListener('keydown', ensureAudioContext, { passive: true });
 
   async function preloadAllSounds() {
     if (soundsReadyPromise) return soundsReadyPromise;
@@ -285,6 +283,39 @@
       tone(110, 0.32, 'sawtooth', 0.35);
       tone(55, 0.48, 'sine', 0.4, 0.02);
     },
+    dog_spawn: () => {
+      noise(1.2, 0.8);
+      tone(60, 1.5, 'sawtooth', 0.4);
+      tone(40, 2.0, 'sine', 0.5, 0.2);
+    },
+    dog_rift: () => {
+      noise(0.6, 0.5);
+      tone(350, 0.4, 'triangle', 0.3);
+      tone(180, 0.6, 'sine', 0.35, 0.1);
+    },
+    dog_attack: () => {
+      noise(0.8, 0.9);
+      tone(120, 0.5, 'sawtooth', 0.5);
+      tone(45, 0.8, 'sine', 0.6, 0.05);
+    },
+    dog_warn: () => {
+      tone(880, 0.15, 'square', 0.25);
+      tone(440, 0.25, 'sawtooth', 0.3, 0.1);
+    },
+    dog_hit: () => {
+      noise(0.25, 0.6);
+      tone(220, 0.2, 'sawtooth', 0.35);
+      tone(90, 0.3, 'triangle', 0.4, 0.05);
+    },
+    dog_death: () => {
+      noise(1.8, 0.8);
+      tone(150, 1.2, 'sawtooth', 0.5);
+      tone(50, 2.0, 'sine', 0.6, 0.3);
+    },
+    dog_death_impact: () => {
+      noise(1.5, 1.0);
+      tone(40, 2.5, 'sine', 0.8);
+    },
   };
   const SFX = Object.fromEntries(
     Object.entries(SYNTH_SFX).map(([k, fn]) => [k, () => playCustomOrFallback(k, fn)])
@@ -417,6 +448,591 @@
     },
   };
 
+  // ---------------- Devourer of Gods Boss Music (dog_music.mp3 - Scourge of the Universe) ----------------
+  const DOG_BGM = {
+    active: false,
+    audio: null,
+    fadeTimer: null,
+    start() {
+      if (this.active) return;
+      this.active = true;
+      if (this.fadeTimer) {
+        clearInterval(this.fadeTimer);
+        this.fadeTimer = null;
+      }
+      try {
+        const a = new Audio('sounds/dog_music.mp3');
+        a.loop = true;
+        a.volume = soundOn ? 0.75 : 0;
+        this.audio = a;
+        a.play().catch(() => {});
+      } catch { /* ignore */ }
+    },
+    syncVolume() {
+      if (this.audio) this.audio.volume = soundOn ? 0.75 : 0;
+    },
+    stop(immediate = false) {
+      if (!this.active && !this.audio) return;
+      this.active = false;
+      if (this.fadeTimer) {
+        clearInterval(this.fadeTimer);
+        this.fadeTimer = null;
+      }
+      if (!this.audio) return;
+      if (immediate || !soundOn) {
+        this.audio.pause();
+        this.audio = null;
+        return;
+      }
+      // Smooth fade-out over ~1.2s upon boss defeat
+      const a = this.audio;
+      this.fadeTimer = setInterval(() => {
+        if (!a) {
+          clearInterval(this.fadeTimer);
+          return;
+        }
+        if (a.volume > 0.06) {
+          a.volume = Math.max(0, a.volume - 0.06);
+        } else {
+          clearInterval(this.fadeTimer);
+          this.fadeTimer = null;
+          a.pause();
+          if (this.audio === a) this.audio = null;
+        }
+      }, 70);
+    },
+  };
+
+  // ---------------- Devourer of Gods Serpentine Canvas Physics & Animation ----------------
+  const DogWorm = {
+    canvas: null,
+    ctx: null,
+    active: false,
+    mode: 'idle', // 'idle' | 'coiling' | 'exiting_expo'
+    segments: [], // 28 segments: { x, y, angle }
+    headImg: null,
+    bodyImg: null,
+    tailImg: null,
+    imagesLoaded: false,
+    raf: 0,
+    lastTime: 0,
+
+    // Dynamic boundary steering & coiling parameters
+    coilCenter: { x: 240, y: 240 },
+    coilRadiusX: 110,
+    coilRadiusY: 80,
+    currentRegionKey: '',
+
+    // Rushing waypoints parameters (for full 28-segment fast rushes)
+    rushWaypointsList: [],
+    rushIndex: 0,
+    rushSpeed: 1400,
+    onSquareHitCallback: null,
+    hitSquaresSet: new Set(),
+    rushPromiseResolve: null,
+    rushDoneHeading: 0,
+
+    // Path history trail buffer for offset sequence following
+    trail: [],
+    totalHeadDist: 0,
+
+    // Entry from random direction parameters
+    entryTarget: { x: 0, y: 0 },
+    entrySpeed: 950,
+    enterPromiseResolve: null,
+
+    // Exit parameters ("face where the head is looking at and then ease expo in out of the board")
+    exitStartTime: 0,
+    exitDuration: 850, // ms
+    exitHeading: 0,
+
+    init() {
+      this.canvas = $('dogCanvas');
+      if (!this.canvas) return;
+      this.ctx = this.canvas.getContext('2d');
+      this.loadSprites();
+      if (!this.segments.length) this.initSegments(28);
+    },
+
+    initTrail(x, y, angle) {
+      this.trail = [];
+      const SPACING = 14;
+      const totalDist = (this.segments.length + 8) * SPACING;
+      const steps = 80;
+      for (let s = 0; s <= steps; s++) {
+        const d = totalDist * (1 - s / steps);
+        this.trail.push({
+          x: x - Math.cos(angle) * d,
+          y: y - Math.sin(angle) * d,
+          angle: angle,
+          dist: -d,
+        });
+      }
+      this.totalHeadDist = 0;
+    },
+
+    loadSprites() {
+      if (this.imagesLoaded) return;
+      let count = 0;
+      const done = () => {
+        count++;
+        if (count === 3) this.imagesLoaded = true;
+      };
+      this.headImg = new Image();
+      this.headImg.onload = done;
+      this.headImg.src = 'dog/head.png';
+
+      this.bodyImg = new Image();
+      this.bodyImg.onload = done;
+      this.bodyImg.src = 'dog/body.png';
+
+      this.tailImg = new Image();
+      this.tailImg.onload = done;
+      this.tailImg.src = 'dog/tail.png';
+    },
+
+    initSegments(num = 28) {
+      this.segments = [];
+      for (let i = 0; i < num; i++) {
+        this.segments.push({ x: -300, y: -300, angle: 0 });
+      }
+    },
+
+    resize() {
+      if (!this.canvas) return;
+      const rect = this.canvas.getBoundingClientRect();
+      const dpr = window.devicePixelRatio || 1;
+      const w = Math.round(rect.width || 480);
+      const h = Math.round(rect.height || 480);
+      if (this.canvas.width !== Math.round(w * dpr) || this.canvas.height !== Math.round(h * dpr)) {
+        this.canvas.width = Math.round(w * dpr);
+        this.canvas.height = Math.round(h * dpr);
+      }
+      if (this.ctx) {
+        this.ctx.setTransform(1, 0, 0, 1, 0, 0);
+        this.ctx.scale(dpr, dpr);
+      }
+    },
+
+    startCoiling(regionSquares) {
+      if (!regionSquares || !regionSquares.length) return Promise.resolve();
+      const regionKey = regionSquares.slice().sort().join(',');
+      const isNewRegion = this.currentRegionKey !== regionKey;
+      if ((this.mode === 'coiling' || this.mode === 'entering_coil') && !isNewRegion) {
+        return Promise.resolve();
+      }
+      return this.enterCoiling(regionSquares);
+    },
+
+    enterCoiling(regionSquares) {
+      if (!regionSquares || !regionSquares.length) return Promise.resolve();
+      this.init();
+      this.resize();
+      const rect = this.canvas ? this.canvas.getBoundingClientRect() : { width: 480, height: 480 };
+      const W = rect.width || 480;
+      const H = rect.height || 480;
+      const sqW = W / 8;
+      const sqH = H / 8;
+      const fl = flipped();
+
+      // Compute center and bounds of region squares
+      let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+      const tileCoords = regionSquares.map((sq) => {
+        const c = sq & 7;
+        const r = sq >> 3;
+        const gc = fl ? 7 - c : c;
+        const gr = fl ? r : 7 - r;
+        const px = gc * sqW + sqW / 2;
+        const py = gr * sqH + sqH / 2;
+        minX = Math.min(minX, px);
+        maxX = Math.max(maxX, px);
+        minY = Math.min(minY, py);
+        maxY = Math.max(maxY, py);
+        return { sq, px, py };
+      });
+
+      this.coilCenter = { x: (minX + maxX) / 2, y: (minY + maxY) / 2 };
+      this.coilRadiusX = Math.max(sqW * 0.9, (maxX - minX) / 2 + sqW * 0.25);
+      this.coilRadiusY = Math.max(sqH * 0.9, (maxY - minY) / 2 + sqH * 0.25);
+      this.currentRegionKey = regionSquares.slice().sort().join(',');
+
+      // Pick a random target tile from the curling region ("into a part of the tiles")
+      const targetTile = tileCoords[Math.floor(Math.random() * tileCoords.length)];
+
+      // Pick a random direction from which to enter
+      const randomAngle = Math.random() * Math.PI * 2;
+      const D = 380; // Distance off-board
+      const startX = targetTile.px - Math.cos(randomAngle) * D;
+      const startY = targetTile.py - Math.sin(randomAngle) * D;
+
+      return new Promise((resolve) => {
+        let resolved = false;
+        const finish = () => {
+          if (resolved) return;
+          resolved = true;
+          this.enterPromiseResolve = null;
+          clearTimeout(timeoutId);
+          resolve();
+        };
+        const timeoutId = setTimeout(finish, 2500);
+
+        this.mode = 'entering_coil';
+        this.entryTarget = { x: targetTile.px, y: targetTile.py };
+        this.entrySpeed = 950; // px/sec fast, smooth swoop into the tiles
+        this.enterPromiseResolve = finish;
+
+        const head = this.segments[0];
+        head.x = startX;
+        head.y = startY;
+        head.angle = randomAngle;
+
+        this.initTrail(startX, startY, randomAngle);
+        const SPACING = 14;
+        for (let i = 1; i < this.segments.length; i++) {
+          this.segments[i].x = startX - Math.cos(randomAngle) * (i * SPACING);
+          this.segments[i].y = startY - Math.sin(randomAngle) * (i * SPACING);
+          this.segments[i].angle = randomAngle;
+        }
+
+        SFX.dog_rift();
+        this.startLoop();
+      });
+    },
+
+    rushWaypoints(waypoints, speed = 1400, onSquareHit = null) {
+      if (!waypoints || waypoints.length < 2) return Promise.resolve();
+      this.init();
+      this.resize();
+      return new Promise((resolve) => {
+        let resolved = false;
+        const finish = () => {
+          if (resolved) return;
+          resolved = true;
+          this.mode = 'idle';
+          clearTimeout(timeoutId);
+          resolve();
+        };
+        const timeoutId = setTimeout(finish, 3500);
+
+        this.mode = 'rushing';
+        this.rushWaypointsList = waypoints;
+        this.rushIndex = 0;
+        this.rushSpeed = speed;
+        this.onSquareHitCallback = onSquareHit;
+        this.hitSquaresSet = new Set();
+        this.rushPromiseResolve = finish;
+
+        const p0 = waypoints[0];
+        const p1 = waypoints[1];
+        const initAngle = Math.atan2(p1.y - p0.y, p1.x - p0.x);
+        const head = this.segments[0];
+        head.x = p0.x;
+        head.y = p0.y;
+        head.angle = initAngle;
+        this.rushDoneHeading = initAngle;
+
+        this.initTrail(p0.x, p0.y, initAngle);
+        const SPACING = 14;
+        for (let i = 1; i < this.segments.length; i++) {
+          this.segments[i].x = p0.x - Math.cos(initAngle) * (i * SPACING);
+          this.segments[i].y = p0.y - Math.sin(initAngle) * (i * SPACING);
+          this.segments[i].angle = initAngle;
+        }
+
+        this.startLoop();
+      });
+    },
+
+    triggerExpoExit() {
+      if (this.mode === 'exiting_expo' || this.mode === 'idle') return;
+      this.mode = 'exiting_expo';
+      this.exitStartTime = performance.now();
+      const head = this.segments[0];
+      // Face where the head is currently looking at!
+      this.exitHeading = head.angle;
+      SFX.dog_rift();
+    },
+
+    startLoop() {
+      if (this.active) return;
+      this.active = true;
+      this.lastTime = performance.now();
+      const tick = (now) => {
+        if (!this.active) return;
+        const dt = Math.min(0.06, (now - this.lastTime) / 1000);
+        this.lastTime = now;
+        this.update(dt, now);
+        this.draw();
+        this.raf = requestAnimationFrame(tick);
+      };
+      this.raf = requestAnimationFrame(tick);
+    },
+
+    stop() {
+      this.active = false;
+      this.mode = 'idle';
+      this.currentRegionKey = '';
+      this.trail = [];
+      this.totalHeadDist = 0;
+      this.enterPromiseResolve = null;
+      cancelAnimationFrame(this.raf);
+      if (this.ctx && this.canvas) {
+        const rect = this.canvas.getBoundingClientRect();
+        this.ctx.clearRect(0, 0, rect.width || 480, rect.height || 480);
+      }
+    },
+
+    update(dt, now) {
+      if (this.mode === 'idle') return;
+      const head = this.segments[0];
+      const oldHeadX = head.x;
+      const oldHeadY = head.y;
+
+      if (this.mode === 'coiling') {
+        const speed = 80; // px/sec: moves slowly in the curling stage
+        head.x += Math.cos(head.angle) * speed * dt;
+        head.y += Math.sin(head.angle) * speed * dt;
+
+        // Progressive edge-proximity steering: the closer it is to the edges of the region, the faster it turns
+        const dx = (head.x - this.coilCenter.x) / this.coilRadiusX;
+        const dy = (head.y - this.coilCenter.y) / this.coilRadiusY;
+        const distNorm = Math.hypot(dx, dy);
+
+        const edgeCloseness = Math.max(0, (distNorm - 0.30) / 0.70);
+        if (edgeCloseness > 0.01) {
+          const targetAngle = Math.atan2(this.coilCenter.y - head.y, this.coilCenter.x - head.x);
+          let diff = targetAngle - head.angle;
+          diff = Math.atan2(Math.sin(diff), Math.cos(diff));
+
+          const extraOut = Math.max(0, distNorm - 1.0);
+          const turnRate = Math.min(18.0, 1.8 * edgeCloseness + 14.0 * Math.pow(edgeCloseness, 2.2) + extraOut * 28.0);
+          const turnStep = Math.sign(diff) * Math.min(Math.abs(diff), turnRate * dt);
+          head.angle += turnStep;
+        } else {
+          // Inside central region: slow, smooth natural slither wave
+          head.angle += Math.sin(now * 0.0022) * 0.38 * dt;
+        }
+      } else if (this.mode === 'entering_coil') {
+        const dx = this.entryTarget.x - head.x;
+        const dy = this.entryTarget.y - head.y;
+        const dist = Math.hypot(dx, dy);
+        const step = this.entrySpeed * dt;
+        if (dist <= step) {
+          head.x = this.entryTarget.x;
+          head.y = this.entryTarget.y;
+          this.mode = 'coiling';
+          SFX.dash();
+          if (this.enterPromiseResolve) {
+            const r = this.enterPromiseResolve;
+            this.enterPromiseResolve = null;
+            r();
+          }
+        } else {
+          head.x += Math.cos(head.angle) * step;
+          head.y += Math.sin(head.angle) * step;
+          if (Math.random() < 0.25) {
+            const rect = this.canvas ? this.canvas.getBoundingClientRect() : { width: 480, height: 480 };
+            const W = rect.width || 480, H = rect.height || 480;
+            if (head.x >= 0 && head.x <= W && head.y >= 0 && head.y <= H) {
+              const sqW = W / 8, sqH = H / 8;
+              const gc = Math.floor(head.x / sqW);
+              const gr = Math.floor(head.y / sqH);
+              const fl = flipped();
+              const c = fl ? 7 - gc : gc;
+              const r = fl ? gr : 7 - gr;
+              const sq = r * 8 + c;
+              if (sq >= 0 && sq < 64) spawnStarlightDust(sq, 2);
+            }
+          }
+        }
+      } else if (this.mode === 'rushing') {
+        const target = this.rushWaypointsList[this.rushIndex + 1];
+        if (target) {
+          const dx = target.x - head.x;
+          const dy = target.y - head.y;
+          const dist = Math.hypot(dx, dy);
+          const step = this.rushSpeed * dt;
+          if (dist <= step) {
+            head.x = target.x;
+            head.y = target.y;
+            this.rushIndex++;
+            if (this.rushIndex < this.rushWaypointsList.length - 1) {
+              const nextTarget = this.rushWaypointsList[this.rushIndex + 1];
+              head.angle = Math.atan2(nextTarget.y - head.y, nextTarget.x - head.x);
+              this.rushDoneHeading = head.angle;
+            } else {
+              this.rushDoneHeading = head.angle;
+            }
+          } else {
+            const angle = Math.atan2(dy, dx);
+            head.angle = angle;
+            head.x += Math.cos(angle) * step;
+            head.y += Math.sin(angle) * step;
+          }
+        } else {
+          // Finished waypoints: move head forward until tail clears the board
+          const step = this.rushSpeed * dt;
+          const heading = this.rushDoneHeading || head.angle;
+          head.x += Math.cos(heading) * step;
+          head.y += Math.sin(heading) * step;
+          head.angle = heading;
+
+          const rect = this.canvas ? this.canvas.getBoundingClientRect() : { width: 480, height: 480 };
+          const W = rect.width || 480, H = rect.height || 480;
+          const tail = this.segments[this.segments.length - 1];
+          const cosH = Math.cos(heading);
+          const sinH = Math.sin(heading);
+          let tailCleared = false;
+          if (cosH > 0.3 && tail.x > W + 140) tailCleared = true;
+          if (cosH < -0.3 && tail.x < -140) tailCleared = true;
+          if (sinH > 0.3 && tail.y > H + 140) tailCleared = true;
+          if (sinH < -0.3 && tail.y < -140) tailCleared = true;
+          if (tailCleared) {
+            this.mode = 'idle';
+            if (this.rushPromiseResolve) {
+              const r = this.rushPromiseResolve;
+              this.rushPromiseResolve = null;
+              r();
+            }
+          }
+        }
+
+        // Trigger onSquareHit when head passes over board squares with ray interpolation for fast dashes
+        if (this.onSquareHitCallback) {
+          const rect = this.canvas ? this.canvas.getBoundingClientRect() : { width: 480, height: 480 };
+          const W = rect.width || 480, H = rect.height || 480;
+          const sqW = W / 8, sqH = H / 8;
+          const fl = flipped();
+          const checkPoint = (px, py) => {
+            if (px >= 0 && px <= W && py >= 0 && py <= H) {
+              const gc = Math.floor(px / sqW);
+              const gr = Math.floor(py / sqH);
+              const c = fl ? 7 - gc : gc;
+              const r = fl ? gr : 7 - gr;
+              const sq = r * 8 + c;
+              if (sq >= 0 && sq < 64 && !this.hitSquaresSet.has(sq)) {
+                this.hitSquaresSet.add(sq);
+                this.onSquareHitCallback(sq);
+              }
+            }
+          };
+          const moveDist = Math.hypot(head.x - oldHeadX, head.y - oldHeadY);
+          const steps = Math.max(1, Math.ceil(moveDist / 12));
+          for (let s = 1; s <= steps; s++) {
+            const frac = s / steps;
+            checkPoint(oldHeadX + frac * (head.x - oldHeadX), oldHeadY + frac * (head.y - oldHeadY));
+          }
+        }
+      } else if (this.mode === 'exiting_expo') {
+        const elapsed = now - this.exitStartTime;
+        const p = Math.min(1.0, elapsed / this.exitDuration);
+        // Exponential ease-in: p === 0 ? 0 : Math.pow(2, 10 * (p - 1))
+        const ease = p === 0 ? 0 : Math.pow(2, 10 * (p - 1));
+        const currentSpeed = 160 + ease * 2500;
+        head.x += Math.cos(this.exitHeading) * currentSpeed * dt;
+        head.y += Math.sin(this.exitHeading) * currentSpeed * dt;
+        head.angle = this.exitHeading;
+
+        const rect = this.canvas ? this.canvas.getBoundingClientRect() : { width: 480, height: 480 };
+        const W = rect.width || 480;
+        const H = rect.height || 480;
+        const margin = 140;
+        const tail = this.segments[this.segments.length - 1];
+        const cosE = Math.cos(this.exitHeading);
+        const sinE = Math.sin(this.exitHeading);
+        let tailCleared = false;
+        if (cosE > 0.3 && tail.x > W + margin) tailCleared = true;
+        if (cosE < -0.3 && tail.x < -margin) tailCleared = true;
+        if (sinE > 0.3 && tail.y > H + margin) tailCleared = true;
+        if (sinE < -0.3 && tail.y < -margin) tailCleared = true;
+        if (tailCleared) {
+          this.stop();
+          return;
+        }
+      }
+
+      // Offset sequence follower: each segment traces the exact trajectory of the head, offset in sequence
+      const SPACING = 14;
+      const moved = Math.hypot(head.x - oldHeadX, head.y - oldHeadY);
+      if (moved > 0.0001) {
+        this.totalHeadDist += moved;
+        this.trail.unshift({
+          x: head.x,
+          y: head.y,
+          angle: head.angle,
+          dist: this.totalHeadDist,
+        });
+
+        // Trim trail points older than the tail
+        const tailTargetDist = this.totalHeadDist - (this.segments.length + 4) * SPACING;
+        while (this.trail.length > 50 && this.trail[this.trail.length - 2].dist < tailTargetDist) {
+          this.trail.pop();
+        }
+      }
+
+      // Position each segment along the head's recorded path offset by i * SPACING
+      let j = 0;
+      for (let i = 1; i < this.segments.length; i++) {
+        const targetDist = this.totalHeadDist - i * SPACING;
+        while (j < this.trail.length - 2 && this.trail[j + 1].dist > targetDist) {
+          j++;
+        }
+        const pA = this.trail[j];
+        const pB = this.trail[j + 1];
+        const span = pA.dist - pB.dist;
+        const t = span > 0.0001 ? Math.max(0, Math.min(1, (targetDist - pB.dist) / span)) : 0;
+        const cur = this.segments[i];
+        cur.x = pB.x + t * (pA.x - pB.x);
+        cur.y = pB.y + t * (pA.y - pB.y);
+
+        let diff = pA.angle - pB.angle;
+        diff = Math.atan2(Math.sin(diff), Math.cos(diff));
+        cur.angle = pB.angle + t * diff;
+      }
+    },
+
+    draw() {
+      if (!this.ctx || !this.canvas) return;
+      const rect = this.canvas.getBoundingClientRect();
+      const W = rect.width || 480;
+      const H = rect.height || 480;
+      this.ctx.clearRect(0, 0, W, H);
+      if (this.mode === 'idle') return;
+
+      // Draw segments in reverse so head is always in front
+      for (let i = this.segments.length - 1; i >= 0; i--) {
+        const seg = this.segments[i];
+        this.ctx.save();
+        this.ctx.translate(seg.x, seg.y);
+        // Calamity pixel sprites naturally face North (upward, -Y).
+        // Since motion angle theta is 0 for East (+X), rotate by theta + PI/2.
+        this.ctx.rotate(seg.angle + Math.PI / 2);
+
+        let img = this.bodyImg;
+        let w = 34, h = 24;
+        if (i === 0) {
+          img = this.headImg;
+          w = 38; h = 44;
+        } else if (i === this.segments.length - 1) {
+          img = this.tailImg;
+          w = 30; h = 28;
+        } else {
+          const taper = 1.0 - (i / this.segments.length) * 0.18;
+          w = Math.round(w * taper);
+          h = Math.round(h * taper);
+        }
+
+        if (img && img.complete) {
+          this.ctx.shadowColor = '#38bdf8';
+          this.ctx.shadowBlur = i === 0 ? 10 : 5;
+          this.ctx.drawImage(img, -w / 2, -h / 2, w, h);
+        }
+        this.ctx.restore();
+      }
+    },
+  };
+  DogWorm.init();
+
   // ---------------- lobby ----------------
   $('nameInput').value = localStorage.getItem('sbc_name') || '';
   $('cardIntervalInput').value = localStorage.getItem('sbc_interval') || '5';
@@ -496,10 +1112,256 @@
   updateRarityUI();
 
   function getName() {
+    if (currentUser && currentUser.username) {
+      return currentUser.username;
+    }
     const n = $('nameInput').value.trim() || 'Player' + Math.floor(Math.random() * 900 + 100);
     localStorage.setItem('sbc_name', n);
     return n;
   }
+
+  function setCurrentUser(user) {
+    if (!user) {
+      currentUser = null;
+      try { localStorage.removeItem('sbc_user'); } catch {}
+      const guestBox = $('accountGuestBox');
+      const userBox = $('accountUserBox');
+      if (guestBox) guestBox.classList.remove('hidden');
+      if (userBox) userBox.classList.add('hidden');
+      $('nameInput').disabled = false;
+      const savedName = localStorage.getItem('sbc_name');
+      if (savedName) $('nameInput').value = savedName;
+      return;
+    }
+
+    // Merge defensively so partial updates never drop skills or equippedSkill
+    const prevSkills = (currentUser && currentUser.id === user.id && Array.isArray(currentUser.skills)) ? currentUser.skills : [];
+    const prevEquipped = (currentUser && currentUser.id === user.id) ? currentUser.equippedSkill : null;
+
+    const newSkills = Array.isArray(user.skills) && user.skills.length ? user.skills : prevSkills;
+    const rawEquipped = user.equippedSkill !== undefined ? user.equippedSkill : prevEquipped;
+    const newEquipped = (typeof rawEquipped === 'object' && rawEquipped) ? rawEquipped.id : (rawEquipped || null);
+
+    currentUser = {
+      ...user,
+      skills: Array.isArray(newSkills) ? [...newSkills] : [],
+      equippedSkill: newEquipped,
+    };
+    try { localStorage.setItem('sbc_user', JSON.stringify(currentUser)); } catch {}
+
+    const guestBox = $('accountGuestBox');
+    const userBox = $('accountUserBox');
+    if (!guestBox || !userBox) return;
+
+    guestBox.classList.add('hidden');
+    userBox.classList.remove('hidden');
+    $('accountUsername').textContent = currentUser.username;
+    $('accountTitleBadge').textContent = currentUser.customTitle || 'Novice Wizard';
+    const stats = currentUser.stats || { wins: 0, losses: 0, draws: 0, winRate: 0 };
+    $('statWins').textContent = stats.wins || 0;
+    $('statLosses').textContent = stats.losses || 0;
+    $('statDraws').textContent = stats.draws || 0;
+    $('statWinRate').textContent = stats.winRate || 0;
+    if ($('statCoins')) $('statCoins').textContent = currentUser.coins || 0;
+    $('nameInput').value = currentUser.username;
+    $('nameInput').disabled = true;
+  }
+
+  // Restore cached account immediately on load so UI doesn't flicker when reloading/changing files
+  try {
+    const cachedUser = JSON.parse(localStorage.getItem('sbc_user') || 'null');
+    if (cachedUser && cachedUser.username) {
+      setCurrentUser(cachedUser);
+    }
+  } catch {}
+
+  function showAuthTab(tab) {
+    const isLogin = tab === 'login';
+    const tabLogin = $('tabLoginBtn');
+    const tabReg = $('tabRegisterBtn');
+    const formLogin = $('loginForm');
+    const formReg = $('registerForm');
+    if (tabLogin) tabLogin.classList.toggle('active', isLogin);
+    if (tabReg) tabReg.classList.toggle('active', !isLogin);
+    if (formLogin) formLogin.classList.toggle('hidden', !isLogin);
+    if (formReg) formReg.classList.toggle('hidden', isLogin);
+    if ($('loginError')) $('loginError').textContent = '';
+    if ($('regError')) $('regError').textContent = '';
+  }
+
+  // Auth UI Event Listeners
+  if ($('openAuthBtn')) {
+    $('openAuthBtn').onclick = () => {
+      showAuthTab('login');
+      $('authModal').classList.remove('hidden');
+    };
+  }
+  if ($('closeAuthBtn')) {
+    $('closeAuthBtn').onclick = () => {
+      $('authModal').classList.add('hidden');
+    };
+  }
+  if ($('tabLoginBtn')) $('tabLoginBtn').onclick = () => showAuthTab('login');
+  if ($('tabRegisterBtn')) $('tabRegisterBtn').onclick = () => showAuthTab('register');
+
+  if ($('loginForm')) {
+    $('loginForm').onsubmit = (e) => {
+      e.preventDefault();
+      if ($('loginError')) $('loginError').textContent = '';
+      const username = $('loginUsername').value.trim();
+      const password = $('loginPassword').value;
+      if (!username || !password) return;
+      socket.emit('auth:login', { username, password }, (res) => {
+        if (!res || !res.success) {
+          if ($('loginError')) $('loginError').textContent = res?.error || 'Login failed.';
+          return;
+        }
+        localStorage.setItem('sbc_auth_token', res.token);
+        setCurrentUser(res.user);
+        $('authModal').classList.add('hidden');
+        $('loginPassword').value = '';
+        toast('Logged in as ' + res.user.username, 'Welcome Back', 'epic');
+      });
+    };
+  }
+
+  if ($('registerForm')) {
+    $('registerForm').onsubmit = (e) => {
+      e.preventDefault();
+      if ($('regError')) $('regError').textContent = '';
+      const username = $('regUsername').value.trim();
+      const password = $('regPassword').value;
+      const confirm = $('regConfirm').value;
+      if (password !== confirm) {
+        if ($('regError')) $('regError').textContent = 'Passwords do not match.';
+        return;
+      }
+      socket.emit('auth:register', { username, password }, (res) => {
+        if (!res || !res.success) {
+          if ($('regError')) $('regError').textContent = res?.error || 'Registration failed.';
+          return;
+        }
+        localStorage.setItem('sbc_auth_token', res.token);
+        setCurrentUser(res.user);
+        $('authModal').classList.add('hidden');
+        $('regPassword').value = '';
+        $('regConfirm').value = '';
+        toast('Account created! Welcome, ' + res.user.username + '!', 'Registered', 'legendary');
+      });
+    };
+  }
+
+  if ($('logoutBtn')) {
+    $('logoutBtn').onclick = () => {
+      const authToken = localStorage.getItem('sbc_auth_token');
+      if (authToken) socket.emit('auth:logout', { authToken });
+      localStorage.removeItem('sbc_auth_token');
+      setCurrentUser(null);
+      toast('You have been logged out.', 'Account', 'common');
+    };
+  }
+
+  // Shop UI Event Listeners & Rendering
+  let cachedShopCatalog = [];
+  function renderShop(catalog) {
+    if (catalog) cachedShopCatalog = catalog;
+    const grid = $('shopGrid');
+    if (!grid) return;
+    $('shopCoinBalance').textContent = currentUser ? (currentUser.coins || 0) : 0;
+    grid.innerHTML = '';
+
+    cachedShopCatalog.forEach((card) => {
+      const userSkills = (currentUser && Array.isArray(currentUser.skills)) ? currentUser.skills : [];
+      const equippedId = currentUser && (typeof currentUser.equippedSkill === 'object' && currentUser.equippedSkill ? currentUser.equippedSkill.id : currentUser.equippedSkill);
+      const owned = userSkills.includes(card.id);
+      const equipped = equippedId === card.id;
+      const canAfford = currentUser && (currentUser.coins || 0) >= card.cost;
+
+      let actionHtml = '';
+      if (!currentUser) {
+        actionHtml = `<button class="btn btn-purple btn-sm" onclick="document.getElementById('openAuthBtn').click()">Log in to Buy</button>`;
+      } else if (equipped) {
+        actionHtml = `<span class="equipped-tag">Equipped</span>`;
+      } else if (owned) {
+        actionHtml = `<button class="btn btn-green btn-sm equip-btn" data-id="${card.id}">Equip</button>`;
+      } else {
+        actionHtml = `<button class="btn btn-purple btn-sm buy-btn" data-id="${card.id}" ${canAfford ? '' : 'disabled'}>Buy (🪙 ${card.cost})</button>`;
+      }
+
+      const item = document.createElement('div');
+      item.className = 'shop-item' + (equipped ? ' equipped' : '');
+      item.innerHTML = `
+        <div class="shop-item-left">
+          <div class="shop-item-icon">${card.icon || '🃏'}</div>
+          <div class="shop-item-details">
+            <div class="shop-item-name">
+              <span>${esc(card.name)}</span>
+              ${owned ? '<span class="player-stat-tag">✓ Owned</span>' : ''}
+            </div>
+            <div class="shop-item-desc">${esc(card.desc)}</div>
+          </div>
+        </div>
+        <div class="shop-item-right">
+          ${!owned ? `<div class="shop-item-cost">🪙 ${card.cost}</div>` : ''}
+          ${actionHtml}
+        </div>`;
+      grid.appendChild(item);
+    });
+
+    grid.querySelectorAll('.buy-btn').forEach((btn) => {
+      btn.onclick = () => {
+        const skillId = btn.dataset.id;
+        socket.emit('shop:buySkill', { skillId }, (res) => {
+          if (!res || res.error) {
+            toast(res?.error || 'Purchase failed', 'Shop', 'common');
+            return;
+          }
+          setCurrentUser(res.user);
+          toast(`Purchased ${res.skill?.name || 'Skill Card'}!`, 'Shop', 'legendary');
+          renderShop();
+        });
+      };
+    });
+
+    grid.querySelectorAll('.equip-btn').forEach((btn) => {
+      btn.onclick = () => {
+        const skillId = btn.dataset.id;
+        socket.emit('shop:equipSkill', { skillId }, (res) => {
+          if (!res || res.error) {
+            toast(res?.error || 'Equip failed', 'Shop', 'common');
+            return;
+          }
+          setCurrentUser(res.user);
+          toast('Equipped Skill Card!', 'Shop', 'epic');
+          renderShop();
+        });
+      };
+    });
+  }
+
+  function openShop() {
+    socket.emit('shop:getCatalog', (res) => {
+      if (res) {
+        if (res.user) setCurrentUser(res.user);
+        if (res.catalog) renderShop(res.catalog);
+      }
+    });
+    $('shopModal').classList.remove('hidden');
+  }
+
+  if ($('openShopBtn')) $('openShopBtn').onclick = openShop;
+  if ($('guestShopBtn')) $('guestShopBtn').onclick = openShop;
+  if ($('closeShopBtn')) $('closeShopBtn').onclick = () => $('shopModal').classList.add('hidden');
+  if ($('useSkillBtn')) {
+    $('useSkillBtn').onclick = () => {
+      socket.emit('useSkill', {}, (res) => {
+        if (res && res.error) {
+          toast('⚠️', res.error, '', 'common', 3000);
+        }
+      });
+    };
+  }
+
   function getCardInterval() {
     const cardInterval = Math.min(20, Math.max(1, parseInt($('cardIntervalInput').value, 10) || 5));
     $('cardIntervalInput').value = cardInterval;
@@ -515,6 +1377,7 @@
       token,
       cardInterval: getCardInterval(),
       rarityWeights: getRarityWeights(),
+      authToken: localStorage.getItem('sbc_auth_token') || null,
     });
   };
   $('quickMatchBtn').onclick = async () => {
@@ -525,6 +1388,7 @@
       token,
       cardInterval: getCardInterval(),
       rarityWeights: getRarityWeights(),
+      authToken: localStorage.getItem('sbc_auth_token') || null,
     });
   };
   $('cancelQmBtn').onclick = () => {
@@ -542,7 +1406,12 @@
     if (code.length < 6) return ($('lobbyError').textContent = 'Enter a 6-character Room ID.');
     $('lobbyError').textContent = '';
     $('quickMatchBox').classList.add('hidden');
-    socket.emit('join', { code, name: getName(), token });
+    socket.emit('join', {
+      code,
+      name: getName(),
+      token,
+      authToken: localStorage.getItem('sbc_auth_token') || null,
+    });
   }
   $('joinBtn').onclick = join;
   $('codeInput').addEventListener('keydown', (e) => e.key === 'Enter' && join());
@@ -552,8 +1421,26 @@
 
   socket.on('connect', async () => {
     await preloadAllSounds();
+    const savedAuthToken = localStorage.getItem('sbc_auth_token');
+    if (savedAuthToken) {
+      socket.emit('auth:verifyToken', { authToken: savedAuthToken }, (res) => {
+        if (res && res.success && res.user) {
+          setCurrentUser(res.user);
+        } else if (res && res.invalid) {
+          localStorage.removeItem('sbc_auth_token');
+          setCurrentUser(null);
+        }
+      });
+    }
     const code = sessionStorage.getItem('sbc_room');
-    if (code) socket.emit('join', { code, name: localStorage.getItem('sbc_name') || 'Player', token });
+    if (code) {
+      socket.emit('join', {
+        code,
+        name: getName(),
+        token,
+        authToken: localStorage.getItem('sbc_auth_token') || null,
+      });
+    }
   });
   socket.on('errorMsg', (msg) => {
     $('lobbyError').textContent = msg;
@@ -576,7 +1463,6 @@
 
   let displayBoard = null; // temporary board override during card choreography
   let isAnimatingCards = false;
-  let currentEffectFourDim = false;
   let currentEffectEventHorizon = 0;
   let pendingSlide = null; // {from, to} for normal move slide
 
@@ -593,8 +1479,7 @@
       s.lastMove &&
       (!prev.lastMove || prev.lastMove.from !== s.lastMove.from || prev.lastMove.to !== s.lastMove.to) &&
       (!s.effects || s.effects.id === lastEffectsId) &&
-      (!s.shotgunFire || s.shotgunFire.id === lastShotgunId) &&
-      (!s.fourDimUnmerge || s.fourDimUnmerge.id === lastFourDimUnmergeId)
+      (!s.shotgunFire || s.shotgunFire.id === lastShotgunId)
     ) {
       pendingSlide = { from: s.lastMove.from, to: s.lastMove.to };
     }
@@ -606,9 +1491,10 @@
       lastMoveCount = s.moves.length;
       lastEffectsId = s.effects ? s.effects.id : null;
       lastShotgunId = s.shotgunFire ? s.shotgunFire.id : null;
-      lastFourDimUnmergeId = s.fourDimUnmerge ? s.fourDimUnmerge.id : null;
+      lastDogDashId = s.dogDash ? s.dogDash.id : null;
+      dogDeathHandled = false;
+      lastDogHp = s.dog ? s.dog.hp : null;
       eventHorizonPendingCut = false;
-      currentEffectFourDim = false;
       currentEffectEventHorizon = 0;
       lastNoticeId = prev && prev.code === s.code ? lastNoticeId : null;
       lastResultKey = null;
@@ -616,6 +1502,7 @@
       selected = null;
       displayBoard = null;
       isAnimatingCards = false;
+      cardUI = { id: null, revealed: false, raf: 0 };
       if (prev && prev.code === s.code) { $('modal').classList.add('hidden'); }
     }
     if (prev && prev.you !== s.you) userFlip = false;
@@ -623,11 +1510,58 @@
 
     if (s.lmsActive) LMS.start();
 
+    // Devourer of Gods BGM (Scourge of the Universe) & Serpentine Animation
+    const hasPendingEffects = !!(s.effects && lastEffectsId !== s.effects.id);
+    const hasPendingDogDash = !!(s.dogDash && lastDogDashId !== s.dogDash.id);
+    const isCardsPendingOrActive = isAnimatingCards || hasPendingEffects || s.phase === 'cards';
+
+    if (s.dog && s.dog.active) {
+      DOG_BGM.start();
+      if (
+        s.dog.phase === 'coiled' &&
+        s.dog.segments &&
+        s.dog.segments.length > 0 &&
+        !isCardsPendingOrActive &&
+        !hasPendingDogDash
+      ) {
+        const regionSquares = s.dog.curlCycle || s.dog.segments.map((seg) => seg.sq);
+        DogWorm.startCoiling(regionSquares);
+      } else if (s.dog.phase === 'telegraph' && !isCardsPendingOrActive && !hasPendingDogDash) {
+        if (DogWorm.mode === 'coiling') {
+          DogWorm.triggerExpoExit();
+        } else if (DogWorm.mode !== 'exiting_expo') {
+          DogWorm.stop();
+        }
+      }
+    } else {
+      DOG_BGM.stop();
+      DogWorm.stop();
+    }
+
+    // Check if DoG just died
+    if (s.dog && !s.dog.active && s.dog.phase === 'dead' && !dogDeathHandled) {
+      dogDeathHandled = true;
+      DOG_BGM.stop();
+      DogWorm.stop();
+      SFX.dog_death();
+      setTimeout(() => SFX.dog_death_impact(), 900);
+      shakeElement($('boardWrap'), 1600, 24, 'hard-to-soft');
+      document.querySelectorAll('.dog-segment').forEach((el) => {
+        el.classList.add('dog-wither-anim');
+        const sq = Number(el.closest('.sq')?.dataset?.sq);
+        if (!isNaN(sq)) spawnStarlightDust(sq, 20);
+      });
+    }
+
     playMoveSounds(s);
     handleCards(s);
-    const animStarted = handleShotgun(s) || handleEffects(s) || handleFourDimUnmerge(s);
+    const animStarted = handleShotgun(s) || handleEffects(s) || handleDogDash(s);
     if (!animStarted) {
       if (!s.lmsActive) LMS.stop();
+      if (!s.dog || !s.dog.active) {
+        DOG_BGM.stop();
+        DogWorm.stop();
+      }
       render();
       if (pendingSlide) {
         slidePieceOnBoard(pendingSlide.from, pendingSlide.to, 260);
@@ -644,6 +1578,9 @@
       if (m.shotgun) {
         // Shotgun move + reload + shoot sounds are handled by handleShotgun()
         SFX.move();
+      } else if (m.san && m.san.includes('xDoG')) {
+        SFX.dog_hit();
+        shakeElement($('boardWrap'), 350, 7, 'hard-to-soft');
       } else if (m.exploded) {
         SFX.boom();
         shakeElement($('boardWrap'), 900, 14, 'hard-to-soft');
@@ -666,9 +1603,72 @@
     return `pieces/${p.c}${p.t.toUpperCase()}${p.t === 'k' && p.pink ? '_pink.svg?v=3' : '.svg'}`;
   }
 
+  let lastDogHp = null;
+  function renderDogBossBar() {
+    const wrap = $('dogBossWrap');
+    if (!wrap) return;
+    if (!S || !S.dog || (!S.dog.active && S.dog.phase !== 'dead')) {
+      wrap.classList.add('hidden');
+      lastDogHp = null;
+      return;
+    }
+    wrap.classList.remove('hidden');
+    const d = S.dog;
+    const hp = Math.max(0, d.hp);
+    const maxHp = d.maxHp || 100;
+    const pct = Math.max(0, Math.min(100, (hp / maxHp) * 100));
+
+    const statusEl = $('dogBossStatus');
+    if (statusEl) {
+      if (d.phase === 'dead') {
+        statusEl.textContent = '• WITHERED';
+        statusEl.style.color = '#a855f7';
+      } else if (d.phase === 'coiled') {
+        statusEl.textContent = '• ATTACK NOW!';
+        statusEl.style.color = '#ef4444';
+      } else if (d.phase === 'telegraph' && d.telegraph) {
+        const lane = d.telegraph.type === 'rank' ? `R${d.telegraph.index + 1}` : `F${FILES[d.telegraph.index].toUpperCase()}`;
+        statusEl.textContent = `• TARGET: ${lane} (${d.turnsUntilAttack}T)`;
+        statusEl.style.color = '#f43f5e';
+      } else {
+        statusEl.textContent = `• VOID (${d.turnsUntilAttack}T)`;
+        statusEl.style.color = '#38bdf8';
+      }
+    }
+
+    const fillEl = $('dogBossFill');
+    const catchupEl = $('dogBossCatchup');
+    const textEl = $('dogBossHpText');
+    if (fillEl) fillEl.style.width = `${pct}%`;
+    if (catchupEl) catchupEl.style.width = `${pct}%`;
+    if (textEl) textEl.textContent = `${hp} / ${maxHp}`;
+
+    if (d.lastHit && lastDogHp !== null && d.hp < lastDogHp) {
+      const inner = $('dogBossInner');
+      if (inner) {
+        inner.classList.remove('dog-bar-hit-shake');
+        void inner.offsetWidth;
+        inner.classList.add('dog-bar-hit-shake');
+      }
+      spawnFloatingDamage(d.lastHit.sq, d.lastHit.dmg);
+    }
+    lastDogHp = d.hp;
+  }
+
+  function spawnFloatingDamage(sq, dmg) {
+    const cell = sqEl(sq);
+    if (!cell) return;
+    const dmgEl = document.createElement('div');
+    dmgEl.className = 'dog-dmg-float';
+    dmgEl.textContent = `Hit! -${dmg}`;
+    cell.appendChild(dmgEl);
+    setTimeout(() => dmgEl.remove(), 1200);
+  }
+
   function render() {
     if (!S) return;
     renderBoard();
+    renderDogBossBar();
     renderBars();
     renderSide();
     $('waitOverlay').classList.toggle('hidden', S.phase !== 'waiting');
@@ -682,7 +1682,52 @@
   }
 
   let isAnimatingEventHorizon = false;
-  let isAnimatingFourDim = false;
+  let ehFlickerTimer = null;
+  let ehFlickerRaf = null;
+  let ehFlickerActive = false;
+
+  function stopEventHorizonFlicker() {
+    ehFlickerActive = false;
+    if (ehFlickerTimer) {
+      clearTimeout(ehFlickerTimer);
+      ehFlickerTimer = null;
+    }
+    if (ehFlickerRaf) {
+      cancelAnimationFrame(ehFlickerRaf);
+      ehFlickerRaf = null;
+    }
+  }
+
+  function startEventHorizonFlicker(bar) {
+    stopEventHorizonFlicker();
+    const wrap = bar.querySelector('.eh-rects-wrap');
+    if (!wrap) return;
+    ehFlickerActive = true;
+
+    function step() {
+      if (!ehFlickerActive || !bar.isConnected) return;
+
+      // Draw MANY random wide rectangles (3 to 5) every single frame continuously without pausing:
+      const numRects = Math.floor(Math.random() * 3) + 3;
+      let html = '';
+      for (let i = 0; i < numRects; i++) {
+        const widthPct = Math.floor(Math.random() * 36) + 50; // 50% to 86% (very wide)
+        const maxLeft = Math.max(0, 100 - widthPct);
+        const leftPct = Math.floor(Math.random() * (maxLeft + 1));
+        const hPx = Math.floor(Math.random() * 16) + 18; // 18px to 34px
+        // Random Y offset so each rectangle shifts vertically while staying connected to the middle line (no gap):
+        const maxOffsetY = Math.floor((hPx - 8) / 2) + 2;
+        const offsetY = Math.floor((Math.random() * 2 - 1) * maxOffsetY);
+
+        html += `<div class="eh-black-rect" style="width:${widthPct}%;left:${leftPct}%;height:${hPx}px;transform:translateY(calc(-50% + ${offsetY}px));"></div>`;
+      }
+      wrap.innerHTML = html;
+
+      ehFlickerRaf = requestAnimationFrame(step);
+    }
+
+    ehFlickerRaf = requestAnimationFrame(step);
+  }
 
   function renderPieceImgsHtml(p) {
     const layers = Array.isArray(p.layers) && p.layers.length > 1 ? p.layers : [p.t];
@@ -696,13 +1741,6 @@
       .join('');
   }
 
-  function renderLayerBadgeHtml(p) {
-    if (!Array.isArray(p.layers) || p.layers.length <= 1) return '';
-    return `<span class="layer-badge" title="Merged 4D Piece: ${p.layers.map((t) => t.toUpperCase()).join(' + ')}">${p.layers
-      .map((t) => t.toUpperCase())
-      .join('+')}</span>`;
-  }
-
   function syncEventHorizonBarrier() {
     const wrap = $('boardWrap');
     const layer = $('vfxLayer');
@@ -710,6 +1748,7 @@
       if (wrap) wrap.classList.remove('eh-active');
       const bar = layer ? layer.querySelector('.eh-barrier') : null;
       if (bar) bar.remove();
+      stopEventHorizonFlicker();
       return;
     }
     const turns = isAnimatingCards
@@ -722,48 +1761,234 @@
       if (!bar) {
         bar = document.createElement('div');
         bar.className = 'eh-barrier';
+        bar.innerHTML = `
+          <div class="eh-black-line"></div>
+          <div class="eh-rects-wrap"></div>
+          <span class="eh-turns" title="Event Horizon: ${turns} turn${turns === 1 ? '' : 's'} remaining">${turns}</span>
+        `;
         layer.appendChild(bar);
+        startEventHorizonFlicker(bar);
+      } else {
+        const turnsEl = bar.querySelector('.eh-turns');
+        if (turnsEl) {
+          turnsEl.textContent = String(turns);
+          turnsEl.title = `Event Horizon: ${turns} turn${turns === 1 ? '' : 's'} remaining`;
+        }
       }
-      bar.innerHTML = `
-        <div class="eh-space-bg"></div>
-        <div class="eh-glitch-layer"></div>
-        <span class="eh-turns" title="Event Horizon: ${turns} turn${turns === 1 ? '' : 's'} remaining">${turns}</span>
-      `;
     } else if (bar) {
       bar.remove();
+      stopEventHorizonFlicker();
     }
   }
 
-  function renderBoard(boardOverride, forceFull8x8) {
+  function positionDogLaneElement(el, tele, fl, badgeText) {
+    if (!el || !tele) return;
+    if (tele.type === 'rank') {
+      const gr = fl ? tele.index : 7 - tele.index;
+      el.className = 'dog-telegraph-lane';
+      el.style.top = (gr * 12.5) + '%';
+      el.style.left = '0%';
+      el.style.width = '100%';
+      el.style.height = '12.5%';
+      el.style.transform = '';
+      if (badgeText !== undefined) {
+        el.innerHTML = badgeText ? `<span class="dog-telegraph-badge">${badgeText}</span>` : '';
+      }
+    } else if (tele.type === 'file') {
+      const gc = fl ? 7 - tele.index : tele.index;
+      el.className = 'dog-telegraph-lane';
+      el.style.top = '0%';
+      el.style.left = (gc * 12.5) + '%';
+      el.style.width = '12.5%';
+      el.style.height = '100%';
+      el.style.transform = '';
+      if (badgeText !== undefined) {
+        el.innerHTML = badgeText ? `<span class="dog-telegraph-badge">${badgeText}</span>` : '';
+      }
+    } else {
+      let sqs = tele.squares;
+      if (!sqs || !sqs.length) {
+        sqs = [];
+        const k = tele.index;
+        for (let r = 0; r < 8; r++) {
+          const c = tele.type === 'diagMain' ? r + k : k - r;
+          if (c >= 0 && c < 8) sqs.push(r * 8 + c);
+        }
+      }
+      if (!sqs.length) return;
+      el.className = 'dog-telegraph-lane diagonal-squares-container';
+      el.style.top = '0%';
+      el.style.left = '0%';
+      el.style.width = '100%';
+      el.style.height = '100%';
+      el.style.transform = '';
+
+      const midIdx = Math.floor(sqs.length / 2);
+      let squaresHtml = '';
+      for (let idx = 0; idx < sqs.length; idx++) {
+        const sq = sqs[idx];
+        const r = sq >> 3, c = sq & 7;
+        const gr = fl ? r : 7 - r;
+        const gc = fl ? 7 - c : c;
+        const isMid = idx === midIdx;
+        const badgeContent = (isMid && badgeText) ? `<span class="dog-telegraph-badge">${badgeText}</span>` : '';
+        squaresHtml += `<div class="dog-telegraph-square" style="left:${gc * 12.5}%;top:${gr * 12.5}%;width:12.5%;height:12.5%;">${badgeContent}</div>`;
+      }
+      el.innerHTML = squaresHtml;
+    }
+  }
+
+  function getDogDashWaypoints(tele, fl, W, H) {
+    const sqW = W / 8;
+    const sqH = H / 8;
+    if (!tele) {
+      return [{ x: -240, y: H / 2 }, { x: W + 240, y: H / 2 }];
+    }
+    if (tele.type === 'rank') {
+      const gr = fl ? tele.index : 7 - tele.index;
+      const y = gr * sqH + sqH / 2;
+      return [{ x: -240, y }, { x: W + 240, y }];
+    }
+    if (tele.type === 'file') {
+      const gc = fl ? 7 - tele.index : tele.index;
+      const x = gc * sqW + sqW / 2;
+      return [{ x, y: -240 }, { x, y: H + 240 }];
+    }
+    // Diagonals (diagMain / diagAnti)
+    let sqs = tele.squares;
+    if (!sqs || !sqs.length) {
+      sqs = [];
+      const k = tele.index;
+      for (let r = 0; r < 8; r++) {
+        const c = tele.type === 'diagMain' ? r + k : k - r;
+        if (c >= 0 && c < 8) sqs.push(r * 8 + c);
+      }
+    }
+    if (!sqs.length) {
+      return [{ x: -240, y: -240 }, { x: W + 240, y: H + 240 }];
+    }
+    const firstSq = sqs[0];
+    const lastSq = sqs[sqs.length - 1];
+    const r1 = firstSq >> 3, c1 = firstSq & 7;
+    const r2 = lastSq >> 3, c2 = lastSq & 7;
+    const gr1 = fl ? r1 : 7 - r1, gc1 = fl ? 7 - c1 : c1;
+    const gr2 = fl ? r2 : 7 - r2, gc2 = fl ? 7 - c2 : c2;
+    const p1x = gc1 * sqW + sqW / 2, p1y = gr1 * sqH + sqH / 2;
+    const p2x = gc2 * sqW + sqW / 2, p2y = gr2 * sqH + sqH / 2;
+    const dx = p2x - p1x, dy = p2y - p1y;
+    const len = Math.hypot(dx, dy);
+    let ux = 0, uy = 0;
+    if (len < 0.001) {
+      const dirX = tele.type === 'diagMain' ? (fl ? -1 : 1) : (fl ? 1 : -1);
+      const dirY = fl ? 1 : -1;
+      ux = dirX * Math.SQRT1_2;
+      uy = dirY * Math.SQRT1_2;
+    } else {
+      ux = dx / len;
+      uy = dy / len;
+    }
+    return [
+      { x: p1x - ux * 240, y: p1y - uy * 240 },
+      { x: p2x + ux * 240, y: p2y + uy * 240 },
+    ];
+  }
+
+  function syncDogTelegraph() {
+    const layer = $('vfxLayer');
+    if (!layer) return;
+    const existing = layer.querySelector('.dog-telegraph-lane');
+    if (!S || !S.dog || !S.dog.active || !S.dog.telegraph || isAnimatingCards) {
+      if (existing) existing.remove();
+      return;
+    }
+    const fl = flipped();
+    const tele = S.dog.telegraph;
+    let teleEl = existing;
+    if (!teleEl) {
+      teleEl = document.createElement('div');
+      teleEl.className = 'dog-telegraph-lane';
+      layer.appendChild(teleEl);
+    }
+    const badgeText = `⚠️ STRIKE IN ${S.dog.turnsUntilAttack} TURNS`;
+    positionDogLaneElement(teleEl, tele, fl, badgeText);
+  }
+
+  function spawnWormhole(sqOrSqs, durationMs = 1500) {
+    const layer = $('vfxLayer');
+    if (!layer) return;
+    const sqs = Array.isArray(sqOrSqs) ? sqOrSqs : [sqOrSqs];
+    if (!sqs.length) return;
+
+    const fl = flipped();
+    let minGr = 8, maxGr = -1, minGc = 8, maxGc = -1;
+    for (const sq of sqs) {
+      const r = sq >> 3, c = sq & 7;
+      const gr = fl ? r : 7 - r;
+      const gc = fl ? 7 - c : c;
+      minGr = Math.min(minGr, gr);
+      maxGr = Math.max(maxGr, gr);
+      minGc = Math.min(minGc, gc);
+      maxGc = Math.max(maxGc, gc);
+    }
+
+    const left = minGc * 12.5;
+    const top = minGr * 12.5;
+    const width = (maxGc - minGc + 1) * 12.5;
+    const height = (maxGr - minGr + 1) * 12.5;
+    const isMultiTile = sqs.length > 1;
+
+    const wh = document.createElement('div');
+    wh.className = 'dog-wormhole' + (isMultiTile ? ' dog-wormhole-dual' : '');
+    wh.style.left = `${left}%`;
+    wh.style.top = `${top}%`;
+    wh.style.width = `${width}%`;
+    wh.style.height = `${height}%`;
+    layer.appendChild(wh);
+    setTimeout(() => wh.remove(), durationMs);
+  }
+
+  function spawnStarlightDust(sq, count = 12) {
+    const cell = sqEl(sq);
+    if (!cell) return;
+    for (let i = 0; i < count; i++) {
+      const p = document.createElement('div');
+      p.className = 'dog-particle';
+      const angle = Math.random() * Math.PI * 2;
+      const dist = 30 + Math.random() * 60;
+      p.style.setProperty('--dx', `${Math.cos(angle) * dist}px`);
+      p.style.setProperty('--dy', `${Math.sin(angle) * dist}px`);
+      p.style.background = i % 2 === 0 ? '#38bdf8' : '#c084fc';
+      cell.appendChild(p);
+      setTimeout(() => p.remove(), 1800);
+    }
+  }
+
+  function renderBoard(boardOverride) {
     const bArr = boardOverride || displayBoard || S.board;
     const board = $('board');
-    const wrap = $('boardWrap');
     board.innerHTML = '';
     const fl = flipped();
-    const activeFourDim = isAnimatingCards ? currentEffectFourDim : !!(S && S.status && S.status.fourDim);
-    const fourDim = !forceFull8x8 && !isAnimatingFourDim && activeFourDim;
-    board.classList.toggle('four-dim-grid', fourDim);
-    if (wrap) wrap.classList.toggle('four-dim-active', fourDim);
     const targets = selected != null ? targetsOf(selected).map((m) => m.to) : [];
-    const dim = fourDim ? 4 : 8;
-    const offset = fourDim ? 2 : 0;
-    const totalCells = dim * dim;
-    for (let i = 0; i < totalCells; i++) {
-      const gr = Math.floor(i / dim);
-      const gc = i % dim;
-      const r = (fl ? gr : dim - 1 - gr) + offset;
-      const f = (fl ? dim - 1 - gc : gc) + offset;
+    for (let i = 0; i < 64; i++) {
+      const gr = Math.floor(i / 8);
+      const gc = i % 8;
+      const r = fl ? gr : 7 - gr;
+      const f = fl ? 7 - gc : gc;
       const sq = r * 8 + f;
       const el = document.createElement('div');
-      el.className = 'sq ' + ((r + f) % 2 === 0 ? 'dark' : 'light') + (gr < dim / 2 ? ' eh-top' : ' eh-bot');
+      el.className = 'sq ' + ((r + f) % 2 === 0 ? 'dark' : 'light') + (gr < 4 ? ' eh-top' : ' eh-bot');
       el.dataset.sq = sq;
       if (!isAnimatingCards && S.lastMove && (S.lastMove.from === sq || S.lastMove.to === sq)) el.classList.add('hl');
       if (selected === sq) el.classList.add('sel');
       if (!isAnimatingCards && S.checkSq === sq) el.classList.add('check');
       if (gc === 0) el.insertAdjacentHTML('beforeend', `<span class="coord rank">${r + 1}</span>`);
-      if (gr === dim - 1) el.insertAdjacentHTML('beforeend', `<span class="coord file">${FILES[f]}</span>`);
+      if (gr === 7) el.insertAdjacentHTML('beforeend', `<span class="coord file">${FILES[f]}</span>`);
       if (S.mines.includes(sq)) el.insertAdjacentHTML('beforeend', '<span class="mine">💣</span>');
+
       const p = bArr[sq];
+      const dogSeg = S && S.dog && S.dog.active && S.dog.segments ? S.dog.segments.find((seg) => seg.sq === sq) : null;
+      const isDogCurledSq = S && S.dog && S.dog.active && S.dog.phase === 'coiled' && (dogSeg || (S.dog.curlCycle && S.dog.curlCycle.includes(sq)));
+      if (isDogCurledSq) el.classList.add('dog-curled-sq');
       if (p) {
         const pe = document.createElement('div');
         pe.className = 'piece';
@@ -771,21 +1996,32 @@
         if (p.shield) pe.classList.add('shield');
         if (p.pink) pe.classList.add('pink');
         if (p.shotgun) pe.classList.add('shotgun');
+        if (dogSeg) pe.classList.add('dog-trapped');
         if (p.t === 'k' && p.shotgun && S.lmsActive && S.lmsColor === p.c) pe.classList.add('lms-king');
         if (drag && drag.from === sq) pe.classList.add('dragging');
         let extraHtml = '';
         if (p.shotgun) extraHtml += '<span class="sg-badge" title="King with a Shotgun">🔫</span>';
-        extraHtml += renderLayerBadgeHtml(p);
         extraHtml += renderHpBarHtml(p);
         pe.innerHTML = `${renderPieceImgsHtml(p)}${extraHtml}`;
         el.appendChild(pe);
       }
+      if (dogSeg) {
+        const canAttack = targets.includes(sq);
+        if (canAttack) {
+          el.classList.add('dog-targetable');
+        }
+      }
       if (targets.includes(sq)) {
-        el.insertAdjacentHTML('beforeend', p ? '<span class="ring"></span>' : '<span class="dot"></span>');
+        if (dogSeg) {
+          el.insertAdjacentHTML('beforeend', '<span class="ring" style="border-color:#ef4444;box-shadow:0 0 12px #ef4444;"></span>');
+        } else {
+          el.insertAdjacentHTML('beforeend', p ? '<span class="ring"></span>' : '<span class="dot"></span>');
+        }
       }
       board.appendChild(el);
     }
     syncEventHorizonBarrier();
+    syncDogTelegraph();
   }
 
   function renderBars() {
@@ -820,6 +2056,17 @@
       const isLMS = S.lmsActive && S.lmsColor === c;
       tags.push(`<span class="tag buff">${isLMS ? '🔥🔫 LAST KING STANDING' : '🔫 Shotgun (Last Piece)'}</span>`);
     }
+    if (info && info.user) {
+      if (info.user.customTitle) {
+        tags.push(`<span class="player-title-tag">${esc(info.user.customTitle)}</span>`);
+      }
+      if (info.user.stats) {
+        tags.push(`<span class="player-stat-tag">(${info.user.stats.wins}W/${info.user.stats.losses}L · 🪙${info.user.coins || 0})</span>`);
+      }
+      if (isYou && currentUser && info.user.id === currentUser.id) {
+        setCurrentUser(info.user);
+      }
+    }
     const active = S.phase === 'play' && S.turn === c;
     const avatarSrc = kingPiece && kingPiece.pink ? `pieces/${c}K_pink.svg?v=3` : `pieces/${c}K.svg`;
     el.classList.toggle('active', active);
@@ -851,6 +2098,34 @@
       $('pips').innerHTML = '';
     }
     $('cardTurns').textContent = `${left} / ${total} turn${total === 1 ? '' : 's'}`;
+
+    // skill card panel
+    const skillPanel = $('skillCardPanel');
+    if (skillPanel) {
+      const mySeat = S.players && S.players[S.you];
+      const myUser = mySeat && mySeat.user;
+      const skill = S.equippedSkill || (myUser && (myUser.skillCard || (typeof myUser.equippedSkill === 'object' ? myUser.equippedSkill : null)));
+      if (!skill) {
+        skillPanel.classList.add('hidden');
+      } else {
+        skillPanel.classList.remove('hidden');
+        if ($('skillCardIcon')) $('skillCardIcon').textContent = skill.icon || '⚡';
+        if ($('skillCardName')) $('skillCardName').textContent = skill.name || 'Skill';
+        if ($('skillCardDesc')) $('skillCardDesc').textContent = skill.desc || '';
+        const used = !!myUser.skillUsed;
+        const badge = $('skillBadgeStatus');
+        const btn = $('useSkillBtn');
+        if (badge) {
+          badge.className = used ? 'skill-badge-used' : 'skill-badge-ready';
+          badge.textContent = used ? 'Used' : 'Ready (1x)';
+        }
+        if (btn) {
+          const canUse = !used && S.phase === 'play' && S.turn === S.you && !isAnimatingCards;
+          btn.disabled = !canUse;
+          btn.textContent = used ? 'Used' : '⚡ Use';
+        }
+      }
+    }
 
     // move list
     const rows = [];
@@ -925,7 +2200,7 @@
       const sqEl = boardEl.querySelector(`[data-sq="${sq}"]`);
       const size = sqEl.getBoundingClientRect().width;
       const ghost = document.createElement('div');
-      ghost.className = 'ghost' + (S.status && S.status.fourDim ? ' four-dim-ghost' : '');
+      ghost.className = 'ghost';
       ghost.style.width = ghost.style.height = size + 'px';
       ghost.innerHTML = renderPieceImgsHtml(S.board[sq]);
       ghost.style.left = e.clientX + 'px';
@@ -1261,7 +2536,7 @@
       ov.classList.remove('leaving');
       ov.innerHTML = '';
     }, 420);
-    cardUI.revealed = true;
+    cardUI = { id: null, revealed: false, raf: 0 };
   }
 
   // ---------------- VFX & Choreography ----------------
@@ -1415,19 +2690,6 @@
       if (!beforeById.has(id)) spawned.push({ sq: aInfo.sq, p: aInfo.p });
     }
     return { moved, replaced, removed, spawned };
-  }
-
-  function get4DTransform(r, f, fl, bs) {
-    const lr = r & 3;
-    const lf = f & 3;
-    const cell8 = bs / 8;
-    const gr = fl ? r : 7 - r;
-    const gc = fl ? 7 - f : f;
-    const gr4D = fl ? lr : 3 - lr;
-    const gc4D = fl ? 3 - lf : lf;
-    const dx = (2 * gc4D - gc + 0.5) * cell8;
-    const dy = (2 * gr4D - gr + 0.5) * cell8;
-    return { dx, dy };
   }
 
   async function playSingleCardVFX(e) {
@@ -1603,6 +2865,7 @@
           bar.style.transform = 'scaleY(0.1)';
           setTimeout(() => bar.remove(), 210);
         }
+        stopEventHorizonFlicker();
 
         boardEl.querySelectorAll('.sq').forEach((cell) => {
           const isTop = cell.classList.contains('eh-top');
@@ -1631,138 +2894,146 @@
       }
 
       // Slicing the board in 2!
-      // Ensure no barrier or turns number is displayed before the cut animation finishes
       eventHorizonPendingCut = true;
       displayBoard = e.before ? e.before.map((p) => (p ? { ...p } : null)) : null;
       renderBoard();
       const existingBar = layer ? layer.querySelector('.eh-barrier') : null;
       if (existingBar) existingBar.remove();
+      stopEventHorizonFlicker();
 
-      if (layer) {
-        const hLine = document.createElement('div');
-        hLine.className = 'distort-slice-line horiz';
-        layer.appendChild(hLine);
-        setTimeout(() => hLine.remove(), 1150);
+      // 1) Impact frame: background and board turn black, pieces hidden, white line across board from side to side for 0.1s
+      const rectBW = wrap ? wrap.getBoundingClientRect() : null;
+      const impact = document.createElement('div');
+      impact.className = 'eh-impact-frame';
+      const whiteLine = document.createElement('div');
+      whiteLine.className = 'eh-impact-white-line';
+      if (rectBW && rectBW.width > 0) {
+        whiteLine.style.left = rectBW.left + 'px';
+        whiteLine.style.width = rectBW.width + 'px';
+        whiteLine.style.top = (rectBW.top + rectBW.height * 0.5 - 1.5) + 'px';
+      } else {
+        whiteLine.style.left = '0%';
+        whiteLine.style.width = '100%';
+        whiteLine.style.top = '50%';
       }
+      impact.appendChild(whiteLine);
+      document.body.appendChild(impact);
+      await wait(100); // exactly 0.1 second!
+      impact.remove();
 
+      // 2) The black line appears with CRAZY shakes!
       SFX.slice();
 
-      boardEl.querySelectorAll('.sq').forEach((cell) => {
-        cell.style.transform = 'translateY(0px)';
-        cell.style.transition = 'transform 300ms cubic-bezier(0.16, 1, 0.3, 1)';
-      });
-      void boardEl.offsetHeight;
-
-      await wait(120);
+      if (layer) {
+        const blackCut = document.createElement('div');
+        blackCut.className = 'eh-black-line-cut';
+        layer.appendChild(blackCut);
+        setTimeout(() => blackCut.remove(), 1200);
+      }
 
       if (wrap) {
         wrap.classList.remove('eh-active');
         wrap.classList.add('slicing');
       }
+
+      // CRAZY SHAKE 1
+      shakeElement(wrap, 900, 32, 'hard-to-soft');
+
       boardEl.querySelectorAll('.sq').forEach((cell) => {
         const isTop = cell.classList.contains('eh-top');
         cell.classList.add('quad-cut');
+        cell.style.transition = 'transform 300ms cubic-bezier(0.16, 1, 0.3, 1)';
         cell.style.transform = `translateY(${isTop ? -18 : 18}px)`;
       });
-      await wait(420);
+      await wait(360);
 
-      // Settle into the 10-turn Event Horizon separation with the glowing void barrier!
+      // Settle into 10-turn Event Horizon separation
       boardEl.querySelectorAll('.sq').forEach((cell) => {
         const isTop = cell.classList.contains('eh-top');
-        cell.style.transition = 'transform 280ms cubic-bezier(0.16, 1, 0.3, 1)';
+        cell.style.transition = 'transform 260ms cubic-bezier(0.16, 1, 0.3, 1)';
         cell.style.transform = `translateY(${isTop ? -9 : 9}px)`;
       });
-      await wait(290);
+      await wait(260);
       SFX.slam();
 
-      // NOW the cut animation has finished: unlock barrier rendering so the glitchy space rift and low-opacity number appear
       if (wrap) wrap.classList.remove('slicing');
       isAnimatingEventHorizon = false;
       eventHorizonPendingCut = false;
       currentEffectEventHorizon = 10;
       displayBoard = e.after ? e.after.map((p) => (p ? { ...p } : null)) : null;
       renderBoard();
-      await shakeElement(wrap, 700, 14, 'hard-to-soft');
+      // CRAZY SHAKE 2
+      await shakeElement(wrap, 1000, 35, 'hard-to-soft');
       return;
     }
 
-    // 0c) 4 DIMENSIONAL LAYER (Event Card):
-    //     Cuts the board into 4 quadrants, turns pieces to 25% opacity, and stacks all 4 quadrants on top of each other in the center!
-    if (id === 'fourDimLayer') {
-      isAnimatingFourDim = true;
+    // 0c) THE DEVOURER OF GODS (Event Boss Card):
+    //     Initial cosmic strike: DoG rushes through rank 4 (left to right) and then rank 5 (right to left) with full 28 segments, devouring pieces with starlight bursts!
+    if (id === 'devourerOfGods') {
       displayBoard = e.before ? e.before.map((p) => (p ? { ...p } : null)) : null;
-      renderBoard(displayBoard, true);
+      renderBoard();
       const wrap = $('boardWrap');
-      if (wrap) wrap.classList.add('slicing');
-      const layer = $('vfxLayer');
-      if (layer) {
-        const hLine = document.createElement('div');
-        hLine.className = 'distort-slice-line horiz';
-        const vLine = document.createElement('div');
-        vLine.className = 'distort-slice-line vert';
-        layer.appendChild(hLine);
-        layer.appendChild(vLine);
-        setTimeout(() => {
-          hLine.remove();
-          vLine.remove();
-        }, 1200);
-      }
+      SFX.dog_spawn();
+      SFX.dog_rift();
 
-      // Step 1: Slice the board into 4 quadrants with slice.mp3 and fade pieces to 25% opacity
-      SFX.slice();
+      // Open 2 cosmic wormhole portals taking 2 tiles of space each (left & right sides of ranks 4 & 5)
+      spawnWormhole([24, 32], 3000); // Left 2-tile portal on file a (a4 & a5)
+      spawnWormhole([31, 39], 3000); // Right 2-tile portal on file h (h4 & h5)
+      await wait(450);
+
       const fl = flipped();
-      const bs = boardEl.getBoundingClientRect().width || 640;
+      const rect = $('boardWrap')?.getBoundingClientRect() || { width: 480, height: 480 };
+      const W = rect.width || 480;
+      const H = rect.height || 480;
+      const sqH = H / 8;
 
-      // Register baseline layout
-      boardEl.querySelectorAll('.sq').forEach((cell) => {
-        cell.style.transform = 'translate(0px, 0px)';
-        cell.style.transition = 'transform 320ms cubic-bezier(0.16, 1, 0.3, 1)';
-      });
-      void boardEl.offsetHeight;
+      const gr4 = fl ? 3 : 4;
+      const gr5 = fl ? 4 : 3;
+      const y4 = gr4 * sqH + sqH / 2;
+      const y5 = gr5 * sqH + sqH / 2;
 
-      await wait(120);
+      // --- Stage 1: Full 28-segment Rush through Rank 4 (Left -> Right) ---
+      SFX.dog_attack();
+      await DogWorm.rushWaypoints(
+        [{ x: -220, y: y4 }, { x: W + 220, y: y4 }],
+        1400,
+        (sq) => {
+          const pe = pieceEl(sq);
+          if (pe) {
+            pe.classList.add('dog-wither-anim');
+            spawnStarlightDust(sq, 14);
+            SFX.capture();
+            shakeElement(wrap, 150, 7, 'hard-to-soft');
+          }
+        }
+      );
 
-      boardEl.querySelectorAll('.sq').forEach((cell) => {
-        const sq = Number(cell.dataset.sq);
-        const r = sq >> 3;
-        const f = sq & 7;
-        const screenRight = fl ? f < 4 : f >= 4;
-        const screenBottom = fl ? r >= 4 : r < 4;
-        const pushX = screenRight ? 16 : -16;
-        const pushY = screenBottom ? 16 : -16;
-        cell.classList.add('quad-cut');
-        cell.style.transform = `translate(${pushX}px, ${pushY}px)`;
-      });
-      boardEl.querySelectorAll('.piece img').forEach((img) => {
-        img.style.transition = 'opacity 360ms ease';
-        img.style.opacity = '0.25';
-      });
-      await wait(360);
+      // Loop around right portal into Rank 5
+      SFX.dog_rift();
+      await wait(180);
 
-      // Step 2: Scale and slide all 4 quadrants into the 4×4 board layout so they stack directly on top of each other at 25% opacity!
+      // --- Stage 2: Full 28-segment Rush through Rank 5 (Right -> Left) ---
+      SFX.dog_attack();
+      await DogWorm.rushWaypoints(
+        [{ x: W + 220, y: y5 }, { x: -220, y: y5 }],
+        1400,
+        (sq) => {
+          const pe = pieceEl(sq);
+          if (pe) {
+            pe.classList.add('dog-wither-anim');
+            spawnStarlightDust(sq, 14);
+            SFX.capture();
+            shakeElement(wrap, 150, 7, 'hard-to-soft');
+          }
+        }
+      );
+
       SFX.dash();
-      boardEl.querySelectorAll('.sq').forEach((cell) => {
-        const sq = Number(cell.dataset.sq);
-        const r = sq >> 3;
-        const f = sq & 7;
-        const qr = r >= 4 ? 1 : 0;
-        const qf = f >= 4 ? 1 : 0;
-        const oldQ = qr * 2 + qf;
-        const tf = get4DTransform(r, f, fl, bs);
-        cell.style.zIndex = String(10 + oldQ);
-        cell.style.transition = 'transform 640ms cubic-bezier(0.16, 1, 0.3, 1), opacity 640ms ease';
-        cell.style.transform = `translate(${tf.dx.toFixed(1)}px, ${tf.dy.toFixed(1)}px) scale(2)`;
-      });
-      await wait(650);
-
-      // Step 3: Commit the merged 4D stacked board (`e.after`) and impact shake!
-      if (wrap) wrap.classList.remove('slicing');
-      currentEffectFourDim = true;
-      isAnimatingFourDim = false;
+      await shakeElement(wrap, 900, 20, 'hard-to-soft');
       displayBoard = e.after ? e.after.map((p) => (p ? { ...p } : null)) : null;
       renderBoard();
-      SFX.slam();
-      await shakeElement(wrap, 750, 15, 'hard-to-soft');
+      renderDogBossBar();
+      DOG_BGM.start();
       return;
     }
 
@@ -2211,10 +3482,6 @@
     if (lastEffectsId === s.effects.id) return false;
     lastEffectsId = s.effects.id;
 
-    // Track chronological board dimensions & event statuses during card VFX
-    const has4D = s.effects.list.some((ef) => ef.card && ef.card.id === 'fourDimLayer');
-    currentEffectFourDim = has4D ? false : !!(s.status && s.status.fourDim);
-
     const ehEffect = s.effects.list.find((ef) => ef.card && ef.card.id === 'eventHorizon');
     if (ehEffect) {
       currentEffectEventHorizon = ehEffect.eventHorizonAction === 'cleared' ? 10 : 0;
@@ -2229,6 +3496,7 @@
       const layer = $('vfxLayer');
       const bar = layer ? layer.querySelector('.eh-barrier') : null;
       if (bar) bar.remove();
+      stopEventHorizonFlicker();
     }
 
     (async () => {
@@ -2242,90 +3510,75 @@
       }
       displayBoard = null;
       isAnimatingCards = false;
-      currentEffectFourDim = !!(S.status && S.status.fourDim);
       currentEffectEventHorizon = S.status && S.status.eventHorizon ? S.status.eventHorizon : 0;
       if (S.lmsActive) LMS.start();
       else LMS.stop();
       render();
-      handleGameOver(S);
+      if (S && S.dogDash && lastDogDashId !== S.dogDash.id) {
+        handleDogDash(S);
+      } else {
+        if (S && S.dog && S.dog.active && S.dog.phase === 'coiled' && S.dog.segments && S.dog.segments.length > 0) {
+          const regionSquares = S.dog.curlCycle || S.dog.segments.map((seg) => seg.sq);
+          DogWorm.startCoiling(regionSquares);
+        }
+        handleGameOver(S);
+      }
     })();
     return true;
   }
 
-  async function playFourDimUnmergeAnimation(u) {
-    const wrap = $('boardWrap');
-    const boardEl = $('board');
-    if (!boardEl) return;
+  let lastDogDashId = null;
+  let dogDeathHandled = false;
 
-    isAnimatingFourDim = true;
-    displayBoard = u.after ? u.after.map((p) => (p ? { ...p } : null)) : null;
-    renderBoard(displayBoard, true);
-
-    if (wrap) {
-      wrap.classList.add('four-dim-active');
-      wrap.classList.add('slicing');
-    }
-
-    const fl = flipped();
-    const bs = boardEl.getBoundingClientRect().width || 640;
-
-    // Start with the squares placed in the stacked 4D configuration at 25% opacity
-    boardEl.querySelectorAll('.sq').forEach((cell) => {
-      const sq = Number(cell.dataset.sq);
-      const r = sq >> 3;
-      const f = sq & 7;
-      const qr = r >= 4 ? 1 : 0;
-      const qf = f >= 4 ? 1 : 0;
-      const oldQ = qr * 2 + qf;
-      const tf = get4DTransform(r, f, fl, bs);
-      cell.classList.add('quad-cut');
-      cell.style.zIndex = String(10 + oldQ);
-      cell.style.transform = `translate(${tf.dx.toFixed(1)}px, ${tf.dy.toFixed(1)}px) scale(2)`;
-    });
-    boardEl.querySelectorAll('.piece img').forEach((img) => {
-      img.style.opacity = '0.25';
-    });
-    void boardEl.offsetHeight;
-
-    // Dimensional rift instability sound
-    SFX.charge();
-    await wait(280);
-
-    // Space unfolds: the 4 quadrants glide apart to their normal 8x8 slots, restoring 100% opacity
-    SFX.dash();
-    boardEl.querySelectorAll('.sq').forEach((cell) => {
-      cell.style.transition = 'transform 650ms cubic-bezier(0.16, 1, 0.3, 1)';
-      cell.style.transform = 'translate(0px, 0px) scale(1)';
-    });
-    boardEl.querySelectorAll('.piece img').forEach((img) => {
-      img.style.transition = 'opacity 650ms ease';
-      img.style.opacity = '1';
-    });
-    await wait(660);
-
-    if (wrap) {
-      wrap.classList.remove('slicing');
-      wrap.classList.remove('four-dim-active');
-    }
-    isAnimatingFourDim = false;
-    displayBoard = null;
-    renderBoard();
-    SFX.slam();
-    await shakeElement(wrap, 700, 14, 'hard-to-soft');
-  }
-
-  function handleFourDimUnmerge(s) {
-    if (!s.fourDimUnmerge) return false;
-    if (lastFourDimUnmergeId === s.fourDimUnmerge.id) return false;
-    lastFourDimUnmergeId = s.fourDimUnmerge.id;
+  function handleDogDash(s) {
+    if (!s.dogDash) return false;
+    if (lastDogDashId === s.dogDash.id) return false;
+    lastDogDashId = s.dogDash.id;
 
     (async () => {
       isAnimatingCards = true;
-      await playFourDimUnmergeAnimation(s.fourDimUnmerge);
-      displayBoard = null;
+      SFX.dog_rift();
+      const tele = s.dogDash.lane;
+      const layer = $('vfxLayer');
+      const wrap = $('boardWrap');
+      const rect = $('boardWrap')?.getBoundingClientRect() || { width: 480, height: 480 };
+      const W = rect.width || 480;
+      const H = rect.height || 480;
+      const fl = flipped();
+
+      if (layer && tele) {
+        const beam = document.createElement('div');
+        beam.className = 'dog-telegraph-lane';
+        positionDogLaneElement(beam, tele, fl, '');
+        layer.appendChild(beam);
+        setTimeout(() => beam.remove(), 1200);
+      }
+      await wait(350);
+
+      // --- Stage 1: Full 28-segment Attack Dash along telegraphed lane ---
+      SFX.dog_attack();
+      const dashWaypoints = getDogDashWaypoints(tele, fl, W, H);
+      await DogWorm.rushWaypoints(dashWaypoints, 1600, (sq) => {
+        if (s.dogDash.wipedSquares && s.dogDash.wipedSquares.some((w) => w.sq === sq)) {
+          const pe = pieceEl(sq);
+          if (pe) pe.classList.add('dog-wither-anim');
+          spawnStarlightDust(sq, 14);
+          SFX.capture();
+          shakeElement(wrap, 160, 8, 'hard-to-soft');
+        }
+      });
+
+      await shakeElement(wrap, 500, 16, 'hard-to-soft');
+      await wait(200);
+
+      // --- Stage 2: Move from a random direction into a part of the tiles and coil! ---
+      if (s.dogDash.segments && s.dogDash.segments.length > 0) {
+        await DogWorm.enterCoiling(s.dogDash.segments.map((x) => x.sq));
+      } else {
+        DogWorm.stop();
+      }
+
       isAnimatingCards = false;
-      if (S.lmsActive) LMS.start();
-      else LMS.stop();
       render();
       handleGameOver(S);
     })();
@@ -2338,6 +3591,10 @@
     const first = lastNoticeId === null && s.moves.length > 0;
     lastNoticeId = s.notice.id;
     if (first) return;
+    if (s.notice.text && s.notice.text.toLowerCase().includes('devourer of gods')) {
+      // User request: remove notification for this boss cuz it's covering the screen
+      return;
+    }
     toast('📣', s.notice.text, '', 'common', 3000);
   }
 
@@ -2361,6 +3618,7 @@
   }
 
   function handleGameOver(s) {
+    if (s.phase === 'over') DogWorm.stop();
     if (isAnimatingCards || s.phase !== 'over' || !s.result) return;
     const key = s.result.winner + s.result.reason + s.moves.length;
     if (key !== lastResultKey) {
@@ -2375,12 +3633,28 @@
     const m = $('modal');
     m.classList.remove('hidden');
     const oppWants = s.rematch[opp(s.you)];
+    const mySeat = s.players && s.players[s.you];
+    let statsNotice = '';
+    let coinsBanner = '';
+    if (s.result.winner === s.you && s.result.coinsAwarded > 0) {
+      const coinMsg = s.result.isDefaultRarity ? '+5 Coins (Default Rarity Win)' : '+1 Coin (Custom Rarity Win)';
+      coinsBanner = `<div style="color:#fbbf24;font-weight:900;font-size:15px;margin:2px 0 6px;">🪙 ${coinMsg}</div>`;
+    }
+    if (mySeat && mySeat.user && mySeat.user.stats) {
+      const st = mySeat.user.stats;
+      statsNotice = `<div style="color:#c084fc;font-weight:800;font-size:13px;margin:4px 0 10px;">Record: ${st.wins}W - ${st.losses}L - ${st.draws}D (${st.winRate || 0}%) · 🪙 ${mySeat.user.coins || 0} Coins</div>`;
+      if (currentUser && mySeat.user.id === currentUser.id) {
+        setCurrentUser(mySeat.user);
+      }
+    }
     m.innerHTML = `
       <div class="modal-box">
         <button class="close" id="closeModal">✕</button>
         <div class="trophy">${rt.icon}</div>
         <h2>${rt.title.replace(/^\S+\s/, '')}</h2>
         <div class="reason">${esc(rt.reason)}</div>
+        ${coinsBanner}
+        ${statsNotice}
         <div class="row">
           <button class="btn btn-green" id="mRematch" ${s.rematch[s.you] ? 'disabled' : ''}>${s.rematch[s.you] ? '⏳ Waiting…' : oppWants ? '↻ Accept Rematch' : '↻ Rematch'}</button>
           <button class="btn btn-gray" id="mLeave">New Room</button>
@@ -2409,6 +3683,7 @@
     localStorage.setItem('sbc_sound', soundOn ? 'on' : 'off');
     $('soundBtn').textContent = soundOn ? '🔊' : '🔇';
     LMS.syncVolume();
+    DOG_BGM.syncVolume();
   };
   $('claimBtn').onclick = () => socket.emit('claimWin');
   $('rematchBtn').onclick = () => socket.emit('rematch');
@@ -2428,17 +3703,21 @@
         <div class="reason">Click any card below to cast it right now as your color (${S.you === 'w' ? 'White' : 'Black'}):</div>
         <div class="debug-card-grid">
           ${allCards
-            .map(
-              (c) => `
-            <button class="debug-card-item ${c.rarity}" data-id="${c.id}">
+            .map((c) => {
+              const isDogActive = c.id === 'devourerOfGods' && S && S.dog && S.dog.active;
+              const disabledAttr = isDogActive ? 'disabled' : '';
+              const disabledClass = isDogActive ? 'disabled' : '';
+              const activeTag = isDogActive ? '<span class="dc-active-tag">ALREADY ACTIVE</span>' : '';
+              return `
+            <button class="debug-card-item ${c.rarity} ${disabledClass}" data-id="${c.id}" ${disabledAttr}>
               <div class="dc-top">
                 <span class="dc-icon">${c.icon}</span>
-                <span class="dc-rarity">${c.rarity}</span>
+                <span class="dc-rarity">${c.rarity}${activeTag}</span>
               </div>
               <div class="dc-name">${esc(c.name)}</div>
               <div class="dc-desc">${esc(c.desc)}</div>
-            </button>`
-            )
+            </button>`;
+            })
             .join('')}
         </div>
       </div>`;
@@ -2446,7 +3725,7 @@
     m.onclick = (e) => {
       if (e.target === m) m.classList.add('hidden');
     };
-    m.querySelectorAll('.debug-card-item').forEach((btn) => {
+    m.querySelectorAll('.debug-card-item:not(:disabled)').forEach((btn) => {
       btn.onclick = () => {
         m.classList.add('hidden');
         socket.emit('testCard', btn.dataset.id);
@@ -2459,6 +3738,8 @@
     leaveRoom();
   };
   function leaveRoom() {
+    DOG_BGM.stop(true);
+    DogWorm.stop();
     socket.emit('leaveRoom');
     sessionStorage.removeItem('sbc_room');
     showLobby();

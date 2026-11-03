@@ -8,10 +8,12 @@ const os = require('os');
 const express = require('express');
 const { Server } = require('socket.io');
 const { Room } = require('./room');
+const { users } = require('./users');
 const keepAwake = require('./keepAwake');
 
 const PORT = Number(process.env.PORT) || 3000;
 const app = express();
+app.use(express.json());
 const soundsDir = path.join(__dirname, '..', 'public', 'sounds');
 
 app.get('/api/sounds', (_req, res) => {
@@ -52,18 +54,119 @@ io.on('connection', (socket) => {
   const room = () => socket.data.room;
   const color = () => socket.data.color;
 
-  socket.on('create', ({ name, token, cardInterval, rarityWeights } = {}) => {
+  // ---------- User Authentication ----------
+  socket.on('auth:register', ({ username, password } = {}, cb) => {
+    const res = users.register(username, password);
+    if (res.error) {
+      if (typeof cb === 'function') cb({ success: false, error: res.error });
+      return;
+    }
+    socket.data.user = res.user;
+    if (typeof cb === 'function') cb({ success: true, token: res.token, user: res.user });
+  });
+
+  socket.on('auth:login', ({ username, password } = {}, cb) => {
+    const res = users.login(username, password);
+    if (res.error) {
+      if (typeof cb === 'function') cb({ success: false, error: res.error });
+      return;
+    }
+    socket.data.user = res.user;
+    if (typeof cb === 'function') cb({ success: true, token: res.token, user: res.user });
+  });
+
+  socket.on('auth:verifyToken', ({ authToken } = {}, cb) => {
+    const user = users.getUserByToken(authToken);
+    if (!user) {
+      if (typeof cb === 'function') cb({ success: false, invalid: true });
+      return;
+    }
+    socket.data.user = user;
+    if (typeof cb === 'function') cb({ success: true, user });
+  });
+
+  socket.on('auth:logout', ({ authToken } = {}, cb) => {
+    users.logout(authToken);
+    socket.data.user = null;
+    if (typeof cb === 'function') cb({ success: true });
+  });
+
+  // ---------- Shop & Skill Cards ----------
+  socket.on('shop:getCatalog', (cb) => {
+    let freshUser = null;
+    if (socket.data.user) {
+      const u = users.getUserById(socket.data.user.id);
+      freshUser = u ? users.publicProfile(u) : socket.data.user;
+      socket.data.user = freshUser;
+    }
+    if (typeof cb === 'function') cb({ catalog: users.getShopCatalog(), user: freshUser });
+  });
+
+  socket.on('shop:buySkill', ({ skillId } = {}, cb) => {
+    if (!socket.data.user) {
+      if (typeof cb === 'function') cb({ error: 'Please log in to purchase skill cards.' });
+      return;
+    }
+    const res = users.buySkill(socket.data.user.id, skillId);
+    if (res.user) {
+      socket.data.user = res.user;
+      if (room()) {
+        const c = color();
+        if (c && room().seats[c]) {
+          room().seats[c].user = res.user;
+          room().broadcast();
+        }
+      }
+    }
+    if (typeof cb === 'function') cb(res);
+  });
+
+  socket.on('shop:equipSkill', ({ skillId } = {}, cb) => {
+    if (!socket.data.user) {
+      if (typeof cb === 'function') cb({ error: 'Please log in to equip skill cards.' });
+      return;
+    }
+    const res = users.equipSkill(socket.data.user.id, skillId);
+    if (res.user) {
+      socket.data.user = res.user;
+      if (room()) {
+        const c = color();
+        if (c && room().seats[c]) {
+          room().seats[c].user = res.user;
+          room().broadcast();
+        }
+      }
+    }
+    if (typeof cb === 'function') cb(res);
+  });
+
+  // ---------- Matchmaking & Room Management ----------
+  socket.on('create', ({ name, token, cardInterval, rarityWeights, authToken } = {}) => {
+    if (authToken && !socket.data.user) {
+      const u = users.getUserByToken(authToken);
+      if (u) socket.data.user = u;
+    }
+    const user = socket.data.user || null;
+    const playerName = user ? user.username : (name || 'Player');
+
     removeFromQueue(socket, token);
     if (room()) room().leave(socket);
     const code = genCode();
     const r = new Room(code, (c) => rooms.delete(c), cardInterval, rarityWeights);
     rooms.set(code, r);
-    r.join(socket, String(token || socket.id), name);
-    console.log(`[room ${code}] created by ${name} (cards every ${r.cardIntervalTurns} turns)`);
+    r.join(socket, String(token || socket.id), playerName, user);
+    console.log(`[room ${code}] created by ${playerName} (cards every ${r.cardIntervalTurns} turns)`);
   });
 
-  socket.on('quickMatch', ({ name, token, cardInterval, rarityWeights } = {}) => {
+  socket.on('quickMatch', ({ name, token, cardInterval, rarityWeights, authToken } = {}) => {
+    if (authToken && !socket.data.user) {
+      const u = users.getUserByToken(authToken);
+      if (u) socket.data.user = u;
+    }
+    const user = socket.data.user || null;
+    const playerName = user ? user.username : (name || 'Player');
     const tk = String(token || socket.id);
+
     removeFromQueue(socket, tk);
     if (room()) {
       room().leave(socket);
@@ -76,17 +179,17 @@ io.on('connection', (socket) => {
         const code = genCode();
         const r = new Room(code, (c) => rooms.delete(c), oppEntry.cardInterval, oppEntry.rarityWeights);
         rooms.set(code, r);
-        r.join(oppEntry.socket, oppEntry.token, oppEntry.name);
-        r.join(socket, tk, name);
+        r.join(oppEntry.socket, oppEntry.token, oppEntry.name, oppEntry.user);
+        r.join(socket, tk, playerName, user);
         oppEntry.socket.emit('quickMatchStatus', { waiting: false, matched: true });
         socket.emit('quickMatchStatus', { waiting: false, matched: true });
-        console.log(`[quickmatch ${code}] ${oppEntry.name} vs ${name}`);
+        console.log(`[quickmatch ${code}] ${oppEntry.name} vs ${playerName}`);
         return;
       }
     }
-    quickMatchQueue.push({ socket, token: tk, name, cardInterval, rarityWeights });
+    quickMatchQueue.push({ socket, token: tk, name: playerName, user, cardInterval, rarityWeights });
     socket.emit('quickMatchStatus', { waiting: true });
-    console.log(`[quickmatch] ${name} is searching for an opponent...`);
+    console.log(`[quickmatch] ${playerName} is searching for an opponent...`);
   });
 
   socket.on('cancelQuickMatch', () => {
@@ -94,17 +197,36 @@ io.on('connection', (socket) => {
     socket.emit('quickMatchStatus', { waiting: false });
   });
 
-  socket.on('join', ({ code, name, token } = {}) => {
+  socket.on('join', ({ code, name, token, authToken } = {}) => {
+    if (authToken && !socket.data.user) {
+      const u = users.getUserByToken(authToken);
+      if (u) socket.data.user = u;
+    }
+    const user = socket.data.user || null;
+    const playerName = user ? user.username : (name || 'Player');
+
     removeFromQueue(socket, token);
     code = String(code || '').trim().toUpperCase();
     const r = rooms.get(code);
     if (!r) return socket.emit('errorMsg', `Room "${code}" was not found.`);
     if (room() && room() !== r) room().leave(socket);
-    const res = r.join(socket, String(token || socket.id), name);
+    const res = r.join(socket, String(token || socket.id), playerName, user);
     if (res.error) socket.emit('errorMsg', res.error);
   });
 
   socket.on('move', (d) => room() && room().move(color(), d || {}));
+  socket.on('useSkill', (params, cb) => {
+    if (typeof params === 'function') {
+      cb = params;
+      params = {};
+    }
+    if (!room()) {
+      if (typeof cb === 'function') cb({ error: 'Not in a game.' });
+      return;
+    }
+    const res = room().useSkill(color(), params || {});
+    if (typeof cb === 'function') cb(res || { success: true });
+  });
   socket.on('pickCard', (i) => room() && room().pickCard(color(), i));
   socket.on('skipToCards', () => room() && room().skipToCards(color()));
   socket.on('testCard', (id) => room() && room().testCard(color(), id));

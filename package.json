@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node server/index.js",
     "online": "node server/index.js --tunnel",
-    "test": "node test/engine.test.js"
+    "test": "node test/engine.test.js && node test/users.test.js && node test/room_auth.test.js && node test/skills.test.js && node test/dog_event.test.js"
   },
   "dependencies": {
     "express": "^4.21.0",

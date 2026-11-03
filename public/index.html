@@ -18,6 +18,40 @@
       <div class="logo"><img src="pieces/wN.svg" alt="" /><span>Spellbound<b>Chess</b></span></div>
       <p class="tagline">Normal chess… until the cards come out. Every 5 turns both players pick a magic card.</p>
 
+      <!-- Account Banner / Profile -->
+      <div id="accountBanner" class="account-banner">
+        <div id="accountGuestBox" class="account-box">
+          <div class="account-info">
+            <span class="account-status-dot guest"></span>
+            <span class="account-name">Playing as <b>Guest</b></span>
+          </div>
+          <div class="account-actions">
+            <button type="button" id="guestShopBtn" class="btn btn-gray btn-sm">🛍️ Shop</button>
+            <button type="button" id="openAuthBtn" class="btn btn-purple btn-sm">🔑 Log In / Sign Up</button>
+          </div>
+        </div>
+        <div id="accountUserBox" class="account-box hidden">
+          <div class="account-details">
+            <div class="account-head">
+              <span class="account-status-dot online"></span>
+              <span id="accountUsername" class="account-username">Wizard</span>
+              <span id="accountTitleBadge" class="account-title-badge">Novice</span>
+            </div>
+            <div id="accountStatsRow" class="account-stats-row">
+              <span title="Coins" class="stat-coins">🪙 <b id="statCoins">0</b></span>
+              <span title="Wins">🏆 <b id="statWins">0</b> W</span>
+              <span title="Losses">💀 <b id="statLosses">0</b> L</span>
+              <span title="Draws">🤝 <b id="statDraws">0</b> D</span>
+              <span title="Win Rate" class="stat-winrate">(<b id="statWinRate">0</b>%)</span>
+            </div>
+          </div>
+          <div class="account-actions">
+            <button type="button" id="openShopBtn" class="btn btn-purple btn-sm">🛍️ Shop</button>
+            <button type="button" id="logoutBtn" class="btn btn-gray btn-sm">Log Out</button>
+          </div>
+        </div>
+      </div>
+
       <label class="field-label" for="nameInput">Your name</label>
       <input id="nameInput" class="input" placeholder="Enter your name" maxlength="20" autocomplete="off" />
 
@@ -112,8 +146,25 @@
     <div class="layout">
       <div class="board-col">
         <div class="player-bar" id="topBar"></div>
+        <div id="dogBossWrap" class="dog-boss-wrap hidden">
+          <div class="dog-boss-wing dog-boss-wing-left"></div>
+          <div class="dog-boss-inner" id="dogBossInner">
+            <div class="dog-boss-bar-track">
+              <div class="dog-boss-bar-catchup" id="dogBossCatchup"></div>
+              <div class="dog-boss-bar-fill" id="dogBossFill"></div>
+              <div class="dog-boss-center-label">
+                <img class="dog-boss-icon" src="dog/icon.png" alt="" />
+                <span class="dog-boss-name">The Devourer of Gods</span>
+                <span class="dog-boss-bar-text" id="dogBossHpText">100 / 100</span>
+                <span class="dog-boss-status-pill" id="dogBossStatus"></span>
+              </div>
+            </div>
+          </div>
+          <div class="dog-boss-wing dog-boss-wing-right"></div>
+        </div>
         <div class="board-wrap" id="boardWrap">
           <div id="board"></div>
+          <canvas id="dogCanvas" class="dog-canvas"></canvas>
           <div id="vfxLayer" class="vfx-layer"></div>
           <div id="fogBanner" class="fog-banner hidden">🌫️ Fog of War — enemy pieces are hidden</div>
           <div id="promo" class="promo hidden"></div>
@@ -151,6 +202,22 @@
           </div>
         </div>
 
+        <!-- Skill Card Panel -->
+        <div id="skillCardPanel" class="panel skill-panel hidden">
+          <div class="skill-panel-head">
+            <div class="panel-title" style="margin:0">Skill Card</div>
+            <span id="skillBadgeStatus" class="skill-badge-ready">Ready (1x)</span>
+          </div>
+          <div class="skill-content">
+            <div class="skill-icon" id="skillCardIcon">♟️</div>
+            <div class="skill-info">
+              <div class="skill-name" id="skillCardName">Quick Pawn</div>
+              <div class="skill-desc" id="skillCardDesc">Pawns can capture backwards this turn.</div>
+            </div>
+            <button type="button" id="useSkillBtn" class="btn btn-purple btn-sm">⚡ Use</button>
+          </div>
+        </div>
+
         <div class="panel moves-panel">
           <div class="panel-title">Moves</div>
           <div id="moveList" class="move-list"></div>
@@ -185,6 +252,52 @@
   <div id="toasts" class="toasts"></div>
   <div id="modal" class="modal hidden"></div>
   <div id="debugCardModal" class="modal hidden"></div>
+
+  <!-- Auth Modal -->
+  <div id="authModal" class="modal hidden">
+    <div class="modal-card auth-card">
+      <button class="modal-close-btn" id="closeAuthBtn" aria-label="Close">&times;</button>
+      <div class="auth-tabs">
+        <button type="button" class="auth-tab active" id="tabLoginBtn">Log In</button>
+        <button type="button" class="auth-tab" id="tabRegisterBtn">Sign Up</button>
+      </div>
+
+      <!-- Login Form -->
+      <form id="loginForm" class="auth-form">
+        <label class="field-label" for="loginUsername">Username</label>
+        <input id="loginUsername" class="input" placeholder="Your username" maxlength="20" autocomplete="username" required />
+        <label class="field-label" for="loginPassword" style="margin-top:10px">Password</label>
+        <input id="loginPassword" type="password" class="input" placeholder="Your password" autocomplete="current-password" required />
+        <div id="loginError" class="error"></div>
+        <button type="submit" class="btn btn-purple btn-big" style="margin-top:14px">Log In</button>
+      </form>
+
+      <!-- Register Form -->
+      <form id="registerForm" class="auth-form hidden">
+        <label class="field-label" for="regUsername">Choose Username</label>
+        <input id="regUsername" class="input" placeholder="3-20 characters" maxlength="20" autocomplete="username" required />
+        <label class="field-label" for="regPassword" style="margin-top:10px">Password</label>
+        <input id="regPassword" type="password" class="input" placeholder="At least 6 characters" autocomplete="new-password" required />
+        <label class="field-label" for="regConfirm" style="margin-top:10px">Confirm Password</label>
+        <input id="regConfirm" type="password" class="input" placeholder="Re-enter password" autocomplete="new-password" required />
+        <div id="regError" class="error"></div>
+        <button type="submit" class="btn btn-green btn-big" style="margin-top:14px">Create Account</button>
+      </form>
+    </div>
+  </div>
+
+  <!-- Shop Modal -->
+  <div id="shopModal" class="modal hidden">
+    <div class="modal-card shop-card">
+      <button class="modal-close-btn" id="closeShopBtn" aria-label="Close">&times;</button>
+      <div class="shop-header">
+        <h2 style="margin:0;font-size:24px;font-weight:900;">🛍️ Skill Card Shop</h2>
+        <div class="shop-balance">Balance: 🪙 <b id="shopCoinBalance">0</b></div>
+      </div>
+      <p class="muted" style="font-size:13px;margin:6px 0 16px;">Equip 1 Skill Card before match. Usable once per game on your turn!</p>
+      <div id="shopGrid" class="shop-grid"></div>
+    </div>
+  </div>
 
   <script src="/socket.io/socket.io.js"></script>
   <script src="app.js"></script>

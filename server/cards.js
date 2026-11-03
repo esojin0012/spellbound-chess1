@@ -18,15 +18,14 @@ const shuffle = (a) => {
   return a;
 };
 const NAME = { w: 'White', b: 'Black' };
-const promoRow = (c, s) => (s && s.fourDim ? (c === 'w' ? 5 : 2) : c === 'w' ? 7 : 0);
-const backRow = (c, s) => (s && s.fourDim ? (c === 'w' ? 2 : 5) : c === 'w' ? 0 : 7);
+const promoRow = (c) => (c === 'w' ? 7 : 0);
+const backRow = (c) => (c === 'w' ? 0 : 7);
 const fwd = (c) => (c === 'w' ? 8 : -8);
 const PIECE_NAME = { p: 'pawn', n: 'knight', b: 'bishop', r: 'rook', q: 'queen', k: 'king' };
 
 function squares(state, pred) {
   const res = [];
   state.board.forEach((p, s) => {
-    if (state.fourDim && !E.inSqBounds(state, s)) return;
     if (pred(p, s)) res.push(s);
   });
   return res;
@@ -136,11 +135,11 @@ const CARDS = [
     id: 'reinforce', name: 'Reinforcements', rarity: 'common', icon: '🪖',
     desc: 'Spawn a new pawn on a random empty square of your 2nd rank.',
     canPlay: (s, c) => {
-      const r = s.fourDim ? (c === 'w' ? 3 : 4) : (c === 'w' ? 1 : 6);
+      const r = c === 'w' ? 1 : 6;
       return squares(s, (p, sq) => row(sq) === r && emptyFree(s)(p, sq)).length > 0;
     },
     apply(s, c) {
-      const r = s.fourDim ? (c === 'w' ? 3 : 4) : (c === 'w' ? 1 : 6);
+      const r = c === 'w' ? 1 : 6;
       const list = squares(s, (p, sq) => row(sq) === r && emptyFree(s)(p, sq));
       if (!list.length) return `${NAME[c]}'s 2nd rank is full — no room for reinforcements.`;
       s.board[pick(list)] = mkPiece('p', c);
@@ -228,11 +227,11 @@ const CARDS = [
     id: 'landmine', name: 'Landmine', rarity: 'common', icon: '💣',
     desc: 'Hide a mine on a random empty square in enemy territory. Enemy pieces (not kings) that step on it explode.',
     canPlay: (s, c) => {
-      const rows = s.fourDim ? (c === 'w' ? [4, 5] : [2, 3]) : c === 'w' ? [4, 5, 6, 7] : [0, 1, 2, 3];
+      const rows = c === 'w' ? [4, 5, 6, 7] : [0, 1, 2, 3];
       return squares(s, (p, sq) => rows.includes(row(sq)) && emptyFree(s)(p, sq)).length > 0;
     },
     apply(s, c) {
-      const rows = s.fourDim ? (c === 'w' ? [4, 5] : [2, 3]) : c === 'w' ? [4, 5, 6, 7] : [0, 1, 2, 3];
+      const rows = c === 'w' ? [4, 5, 6, 7] : [0, 1, 2, 3];
       const list = squares(s, (p, sq) => rows.includes(row(sq)) && emptyFree(s)(p, sq));
       if (!list.length) return 'No room for a mine.';
       s.mines.push({ sq: pick(list), owner: c });
@@ -459,10 +458,10 @@ const CARDS = [
       const homes = { q: [3], r: [0, 7], b: [2, 5], n: [1, 6], p: [8, 9, 10, 11, 12, 13, 14, 15] }[t];
       const flip = (sq) => (c === 'w' ? sq : sq ^ 56);
       const free = (sq) => E.inSqBounds(s, sq) && !s.board[sq] && !mine(s, sq);
-      let target = s.fourDim ? null : homes.map(flip).find(free);
+      let target = homes.map(flip).find(free);
       if (target == null) {
-        const pref = squares(s, (p, sq) => free(sq) && (t === 'p' ? row(sq) !== backRow('w', s) && row(sq) !== backRow('b', s) : true));
-        pref.sort((a, b) => Math.abs(row(a) - backRow(c, s)) - Math.abs(row(b) - backRow(c, s)));
+        const pref = squares(s, (p, sq) => free(sq) && (t === 'p' ? row(sq) !== backRow('w') && row(sq) !== backRow('b') : true));
+        pref.sort((a, b) => Math.abs(row(a) - backRow(c)) - Math.abs(row(b) - backRow(c)));
         target = pref[0];
       }
       if (target == null) return 'No room for the undead.';
@@ -554,11 +553,11 @@ const CARDS = [
     id: 'armyOfDarkness', name: 'Army of Darkness', rarity: 'legendary', icon: '🦇',
     desc: 'Fill your 3rd rank with pawns. All your pawns are uncapturable for 2 turns.',
     canPlay: (s, c) => {
-      const r = s.fourDim ? (c === 'w' ? 3 : 4) : c === 'w' ? 2 : 5;
+      const r = c === 'w' ? 2 : 5;
       return squares(s, (p, sq) => row(sq) === r && emptyFree(s)(p, sq)).length > 0 || squares(s, ownOf(c, 'p')).length > 0;
     },
     apply(s, c) {
-      const r = s.fourDim ? (c === 'w' ? 3 : 4) : c === 'w' ? 2 : 5;
+      const r = c === 'w' ? 2 : 5;
       const list = squares(s, (p, sq) => row(sq) === r && emptyFree(s)(p, sq));
       list.forEach((sq) => (s.board[sq] = mkPiece('p', c)));
       squares(s, ownOf(c, 'p')).forEach((sq) => (s.board[sq].shield = Math.max(s.board[sq].shield || 0, 2)));
@@ -607,20 +606,6 @@ const CARDS = [
       const mapSq = (oldSq) => {
         const r = row(oldSq);
         const f = col(oldSq);
-        if (s.fourDim) {
-          if (!E.inBoardBounds(s, f, r)) return oldSq;
-          const lr = r - 2;
-          const lf = f - 2;
-          const qr = lr >= 2 ? 1 : 0;
-          const qf = lf >= 2 ? 1 : 0;
-          const oldQ = qr * 2 + qf;
-          const newQ = chosenPerm.indexOf(oldQ);
-          const nqr = newQ >> 1;
-          const nqf = newQ & 1;
-          const nr = 2 + nqr * 2 + (lr & 1);
-          const nf = 2 + nqf * 2 + (lf & 1);
-          return nr * 8 + nf;
-        }
         const qr = r >= 4 ? 1 : 0;
         const qf = f >= 4 ? 1 : 0;
         const oldQ = qr * 2 + qf;
@@ -646,7 +631,7 @@ const CARDS = [
       const wk = E.kingSq(s, 'w');
       const bk = E.kingSq(s, 'b');
       if (wk >= 0 && bk >= 0 && Math.abs(row(wk) - row(bk)) <= 1 && Math.abs(col(wk) - col(bk)) <= 1) {
-        const altSq = s.fourDim ? row(bk) * 8 + (7 - col(bk)) : bk ^ 3;
+        const altSq = bk ^ 3;
         [s.board[bk], s.board[altSq]] = [s.board[altSq], s.board[bk]];
       }
 
@@ -693,234 +678,119 @@ const CARDS = [
     },
   },
   {
-    id: 'fourDimLayer', name: '4 Dimensional Layer', rarity: 'event', icon: '💠',
-    desc: 'Cut the board into 4 pieces and layer them on top of each other for 1 turn! All pieces become 25% opacity and overlapping pieces merge! Afterwards everything unfolds back to its own quadrant.',
+    id: 'devourerOfGods',
+    name: 'The Devourer of Gods',
+    rarity: 'event',
+    icon: '🌌',
+    desc: 'The cosmic serpent strikes! Devours ranks 4 & 5, then stalks off-board, telegraphing attacks every 6 turns before striking and coiling.',
     ignoreCheck: true,
-    canPlay: (s) => !s.fourDim,
-    apply(s, color) {
-      const RANK_PRIORITY = { k: 100, q: 9, r: 5, b: 3, n: 3, p: 1 };
-      // Ensure the two kings don't map to the exact same (lr, lf) cell when the 4 quadrants stack
-      const wk0 = E.kingSq(s, 'w');
-      let bk0 = E.kingSq(s, 'b');
-      if (wk0 >= 0 && bk0 >= 0 && (row(wk0) & 3) === (row(bk0) & 3) && (col(wk0) & 3) === (col(bk0) & 3)) {
-        const altBk = bk0 ^ 1;
-        [s.board[bk0], s.board[altBk]] = [s.board[altBk], s.board[bk0]];
-        bk0 = altBk;
-      }
-
-      // Every original piece is remembered as a "part" (with the quadrant it came from),
-      // so the stack can be unlayered back to the right place when the 4th dimension collapses.
-      const toPart = (p, sq) => ({
-        id: p.id,
-        t: p.t,
-        c: p.c,
-        qr: row(sq) >> 2,
-        qf: col(sq) >> 2,
-        pink: !!p.pink,
-        shotgun: !!p.shotgun,
-        dmg: p.dmg || 0,
-        frozen: p.frozen || 0,
-        shield: p.shield || 0,
-      });
-
-      const mergeStack = (entries) => {
-        if (!entries.length) return null;
-        const pieces = entries.map((en) => en.p);
-        const parts = entries.map((en) => toPart(en.p, en.sq));
-        if (pieces.length === 1) {
-          const p0 = pieces[0];
-          return { ...p0, layers: [p0.t], parts };
-        }
-        let winColor = color || 'w';
-        const kingPiece = pieces.find((p) => E.hasType(p, 'k'));
-        if (kingPiece) {
-          winColor = kingPiece.c;
-        } else {
-          let wScore = 0;
-          let bScore = 0;
-          for (const p of pieces) {
-            const val = (VALUES[p.t] || 1) + 10;
-            if (p.c === 'w') wScore += val;
-            else bScore += val;
-          }
-          if (wScore > bScore) winColor = 'w';
-          else if (bScore > wScore) winColor = 'b';
-        }
-
-        const combinedLayers = [];
-        let pink = false;
-        let shotgun = false;
-        let shield = 0;
-        let frozen = 0;
-        for (const p of pieces) {
-          if (p.c === winColor) {
-            if (p.pink) pink = true;
-            if (p.shotgun) shotgun = true;
-            if (p.shield > shield) shield = p.shield;
-          }
-          if (p.t === 'k' && p.c !== winColor) continue;
-          combinedLayers.push(p.t);
-        }
-        if (!combinedLayers.length) combinedLayers.push(pieces[0].t);
-        let bestT = combinedLayers[0];
-        for (const lt of combinedLayers) {
-          if ((RANK_PRIORITY[lt] || 0) > (RANK_PRIORITY[bestT] || 0)) bestT = lt;
-        }
-        const merged = mkPiece(bestT, winColor);
-        merged.layers = combinedLayers;
-        merged.parts = parts;
-        if (pink) merged.pink = true;
-        if (shotgun) merged.shotgun = true;
-        if (shield > 0) merged.shield = shield;
-        if (frozen > 0) merged.frozen = frozen;
-        return merged;
-      };
-
-      const newBoard = new Array(64).fill(null);
-      for (let lr = 0; lr < 4; lr++) {
-        for (let lf = 0; lf < 4; lf++) {
-          const sqs = [
-            lr * 8 + lf,
-            lr * 8 + (lf + 4),
-            (lr + 4) * 8 + lf,
-            (lr + 4) * 8 + (lf + 4),
-          ];
-          const stack = sqs.filter((sq) => s.board[sq]).map((sq) => ({ p: s.board[sq], sq }));
-          const destSq = (lr + 2) * 8 + (lf + 2);
-          newBoard[destSq] = mergeStack(stack);
-        }
-      }
-
-      s.board = newBoard;
-      s.fourDim = 2; // 1 full turn: each player gets one move inside the 4th dimension
-      s.castling = { wK: false, wQ: false, bK: false, bQ: false };
-      s.ep = null;
-      s.mines = s.mines.map((m) => ({
-        ...m,
-        qr: row(m.sq) >> 2,
-        qf: col(m.sq) >> 2,
-        sq: ((row(m.sq) & 3) + 2) * 8 + ((col(m.sq) & 3) + 2),
-      }));
-
-      // Ensure the two kings didn't land on adjacent squares of the 4x4 grid
-      const wk = E.kingSq(s, 'w');
-      const bk = E.kingSq(s, 'b');
-      if (wk >= 0 && bk >= 0 && Math.abs(row(wk) - row(bk)) <= 1 && Math.abs(col(wk) - col(bk)) <= 1) {
-        const targetRow = row(wk) <= 3 ? 5 : 2;
-        const targetCol = col(wk) <= 3 ? 5 : 2;
-        const altSq = targetRow * 8 + targetCol;
-        [s.board[bk], s.board[altSq]] = [s.board[altSq], s.board[bk]];
-      }
-
-      // Freeze any non-king piece that immediately checks a king right out of the 4D merge for 1 turn
-      for (const kingColor of ['w', 'b']) {
-        if (inCheck(s, kingColor)) {
-          const enemy = opp(kingColor);
-          for (let sq = 0; sq < 64; sq++) {
-            const p = s.board[sq];
-            if (!p || p.c !== enemy || E.hasType(p, 'k') || p.frozen > 0) continue;
-            p.frozen = 1;
-            if (!inCheck(s, kingColor)) break;
-            p.frozen = 0;
-          }
-          if (inCheck(s, kingColor)) {
-            for (let sq = 0; sq < 64; sq++) {
-              const p = s.board[sq];
-              if (p && p.c === enemy && !E.hasType(p, 'k')) p.frozen = Math.max(p.frozen || 0, 1);
+    canPlay: (s) => !s || !s.dog || !s.dog.active,
+    apply(s) {
+      const wipedSquares = [];
+      for (let sq = 24; sq < 40; sq++) {
+        const p = s.board[sq];
+        if (!p) continue;
+        if (E.hasType(p, 'k')) {
+          const targetRow = row(sq) === 3 ? 2 : 5;
+          let safeSq = -1;
+          const colOrder = [0, 1, -1, 2, -2, 3, -3, 4, -4, 5, -5, 6, -6, 7, -7];
+          const c0 = col(sq);
+          for (const d of colOrder) {
+            const cc = c0 + d;
+            if (cc >= 0 && cc <= 7) {
+              const testSq = targetRow * 8 + cc;
+              if (!s.board[testSq] && ((testSq >= 16 && testSq < 24) || (testSq >= 40 && testSq < 48))) {
+                safeSq = testSq;
+                break;
+              }
             }
           }
+          if (safeSq === -1) {
+            for (let cand = 0; cand < 64; cand++) {
+              if (cand < 24 || cand >= 40) {
+                if (!s.board[cand]) { safeSq = cand; break; }
+              }
+            }
+          }
+          if (safeSq !== -1) {
+            s.board[safeSq] = p;
+            s.board[sq] = null;
+          }
+        } else {
+          E.recordLost(s, p);
+          s.board[sq] = null;
+          wipedSquares.push({ sq, piece: p.t, color: p.c });
         }
       }
+      updateCastling(s);
 
-      return `💠 4 DIMENSIONAL LAYER! The 4 quadrants stacked onto each other for 1 turn — overlapping pieces merged into 4D hybrids!`;
+      s.dog = {
+        active: true,
+        hp: 100,
+        maxHp: 100,
+        phase: 'idle',
+        turnsUntilAttack: 10,
+        telegraph: null,
+        segments: [],
+        lastHit: null,
+      };
+
+      s.lastDogEvent = {
+        action: 'spawn',
+        wipedSquares,
+        ranks: [4, 5],
+      };
+
+      return `🌌 A cosmic rift tears through reality! The Devourer of Gods devoured ranks 4 & 5 and stalks the board!`;
     },
   },
 ];
 
-const BY_ID = Object.fromEntries(CARDS.map((c) => [c.id, c]));
+const DOG_COIL_TEMPLATES = [
+  // 2x3 horizontal rectangle loop
+  { dr: 2, dc: 3, offsets: [[0,0], [0,1], [0,2], [1,2], [1,1], [1,0]] },
+  // 3x2 vertical rectangle loop
+  { dr: 3, dc: 2, offsets: [[0,0], [1,0], [2,0], [2,1], [1,1], [0,1]] },
+  // Diamond / hexagon loop
+  { dr: 3, dc: 3, offsets: [[0,1], [0,2], [1,2], [2,1], [2,0], [1,0]] },
+  // L-hook horizontal
+  { dr: 2, dc: 4, offsets: [[0,0], [0,1], [0,2], [0,3], [1,3], [1,2]] },
+  // L-hook vertical
+  { dr: 4, dc: 2, offsets: [[0,0], [1,0], [2,0], [3,0], [3,1], [2,1]] },
+  // S-serpentine curve
+  { dr: 3, dc: 3, offsets: [[0,0], [0,1], [1,1], [1,2], [2,2], [2,1]] },
+  // Horseshoe loop
+  { dr: 3, dc: 3, offsets: [[0,0], [1,0], [2,0], [2,1], [2,2], [1,2]] },
+];
 
-// Collapse the 4th dimension: every stacked piece is unlayered back into its OWN quadrant.
-// A stack that moved during 4D carries all its parts with it, so each part lands at
-// (its original quadrant) + (the stack's current local position in the 4×4).
-function unmergeFourDim(s) {
-  const oldBoard = s.board;
-  const newBoard = new Array(64).fill(null);
-  const orphans = [];
-  for (let r = 2; r <= 5; r++) {
-    for (let f = 2; f <= 5; f++) {
-      const p = oldBoard[r * 8 + f];
-      if (!p) continue;
-      const lr = r - 2;
-      const lf = f - 2;
-      if (!Array.isArray(p.parts) || !p.parts.length) {
-        orphans.push({ p, lr, lf });
-        continue;
-      }
-      for (const part of p.parts) {
-        const dest = (part.qr * 4 + lr) * 8 + (part.qf * 4 + lf);
-        const piece = { id: part.id, t: part.t, c: part.c };
-        if (part.pink) piece.pink = true;
-        if (part.shotgun) piece.shotgun = true;
-        if (part.dmg) piece.dmg = part.dmg;
-        // Statuses applied to the merged stack carry over to the parts that share its color
-        const frozen = part.c === p.c ? Math.max(part.frozen || 0, p.frozen || 0) : part.frozen || 0;
-        const shield = part.c === p.c ? Math.max(part.shield || 0, p.shield || 0) : part.shield || 0;
-        if (frozen > 0) piece.frozen = frozen;
-        if (shield > 0) piece.shield = shield;
-        if (newBoard[dest]) orphans.push({ p: piece, lr, lf });
-        else newBoard[dest] = piece;
+function findDogCurlingPath(board, neededLength = 6) {
+  // Find a connected 6-square shape (rectangle, L-hook, diamond, S-curve, horseshoe) that avoids kings.
+  // Any existing pieces on these squares remain completely intact (dog-trapped).
+  const candidates = [];
+
+  for (const tmpl of DOG_COIL_TEMPLATES) {
+    for (let r = 0; r <= 8 - tmpl.dr; r++) {
+      for (let c = 0; c <= 8 - tmpl.dc; c++) {
+        const cycle = tmpl.offsets.map(([dr, dc]) => (r + dr) * 8 + (c + dc));
+        const hasKing = cycle.some((sq) => board[sq] && E.hasType(board[sq], 'k'));
+        if (!hasKing) {
+          const pieceCount = cycle.filter((sq) => !!board[sq]).length;
+          candidates.push({ cycle, pieceCount });
+        }
       }
     }
   }
-  // Anything without an origin (should be rare) goes to its own side's quadrant, or the nearest free square
-  for (const { p, lr, lf } of orphans) {
-    const clean = { ...p };
-    delete clean.layers;
-    delete clean.parts;
-    const qr = p.c === 'w' ? 0 : 1;
-    const tries = [
-      (qr * 4 + lr) * 8 + lf,
-      (qr * 4 + lr) * 8 + lf + 4,
-      ((1 - qr) * 4 + lr) * 8 + lf,
-      ((1 - qr) * 4 + lr) * 8 + lf + 4,
-    ];
-    let dest = tries.find((sq) => !newBoard[sq]);
-    if (dest == null) dest = newBoard.findIndex((x) => !x);
-    if (dest >= 0) newBoard[dest] = clean;
-  }
-  s.board = newBoard;
-  s.mines = s.mines.map((m) => {
-    const lr = row(m.sq) - 2;
-    const lf = col(m.sq) - 2;
-    const sq = m.qr != null && lr >= 0 && lr < 4 && lf >= 0 && lf < 4 ? (m.qr * 4 + lr) * 8 + (m.qf * 4 + lf) : m.sq;
-    return { sq, owner: m.owner };
-  });
-  s.mines = s.mines.filter((m) => !newBoard[m.sq]);
-  s.fourDim = 0;
-  s.ep = null;
 
-  // Ensure the two kings don't end up on adjacent squares after unmerging
-  const wk = E.kingSq(s, 'w');
-  const bk = E.kingSq(s, 'b');
-  if (wk >= 0 && bk >= 0 && Math.abs(row(wk) - row(bk)) <= 1 && Math.abs(col(wk) - col(bk)) <= 1) {
-    const altSq = bk ^ 3;
-    [s.board[bk], s.board[altSq]] = [s.board[altSq], s.board[bk]];
-  }
+  if (!candidates.length) return null;
 
-  normalize(s);
+  // Shuffle for variety so DoG takes varied exciting shapes across games!
+  shuffle(candidates);
+  candidates.sort((a, b) => a.pieceCount - b.pieceCount);
 
-  // Unfolding must never hand anyone a free king capture: briefly stun any piece giving a surprise check.
-  for (const kingColor of ['w', 'b']) {
-    if (!inCheck(s, kingColor)) continue;
-    const enemy = opp(kingColor);
-    for (let sq = 0; sq < 64 && inCheck(s, kingColor); sq++) {
-      const p = s.board[sq];
-      if (!p || p.c !== enemy || p.t === 'k' || p.frozen > 0) continue;
-      p.frozen = 1;
-      if (inCheck(s, kingColor)) p.frozen = 0;
-    }
-  }
+  return candidates[0].cycle;
 }
+
+const BY_ID = Object.fromEntries(CARDS.map((c) => [c.id, c]));
 
 function rollHand(state, color, customWeights) {
   const playable = CARDS.filter((c) => !state || !color || !c.canPlay || c.canPlay(state, color));
@@ -986,4 +856,4 @@ function applyCard(state, color, id) {
   return `${card.name} fizzled — the magic was unstable!`;
 }
 
-module.exports = { CARDS, BY_ID, RARITY_WEIGHTS, rollHand, publicCard, applyCard, unmergeFourDim };
+module.exports = { CARDS, BY_ID, RARITY_WEIGHTS, rollHand, publicCard, applyCard, findDogCurlingPath };

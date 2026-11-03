@@ -61,7 +61,8 @@ function initialState() {
     skip: { w: 0, b: 0 }, // skip next turn
     nextCardPicks: { w: 1, b: 1 }, // how many cards each player gets to pick on the next card phase
     eventHorizon: 0, // turns remaining where board is sliced in 2 horizontally (rank 1-4 vs rank 5-8)
-    fourDim: 0, // turns remaining where 4 Dimensional Layer is active (board stacked into center 4×4 with merged pieces)
+    activeSkill: null, // { type, color } for 1-turn skill cards
+    dog: null, // Devourer of Gods boss state
     repetition: {},
   };
   s.repetition[posKey(s)] = 1;
@@ -71,9 +72,7 @@ function initialState() {
 function cloneState(s) {
   return {
     ...s,
-    board: s.board.map((p) =>
-      p ? { ...p, layers: p.layers ? [...p.layers] : undefined, parts: p.parts ? p.parts.map((x) => ({ ...x })) : undefined } : null
-    ),
+    board: s.board.map((p) => (p ? { ...p } : null)),
     castling: { ...s.castling },
     lost: { w: [...s.lost.w], b: [...s.lost.b] },
     mines: s.mines.map((m) => ({ ...m })),
@@ -82,12 +81,19 @@ function cloneState(s) {
     skip: { ...s.skip },
     nextCardPicks: { ...(s.nextCardPicks || { w: 1, b: 1 }) },
     eventHorizon: s.eventHorizon || 0,
-    fourDim: s.fourDim || 0,
+    activeSkill: s.activeSkill ? { ...s.activeSkill } : null,
+    dog: s.dog
+      ? {
+          ...s.dog,
+          telegraph: s.dog.telegraph ? { ...s.dog.telegraph } : null,
+          segments: s.dog.segments ? s.dog.segments.map((seg) => ({ ...seg })) : [],
+          lastHit: s.dog.lastHit ? { ...s.dog.lastHit } : null,
+        }
+      : null,
   };
 }
 
 function inBoardBounds(state, f, r) {
-  if (state && (state.fourDim || 0) > 0) return f >= 2 && f <= 5 && r >= 2 && r <= 5;
   return f >= 0 && f <= 7 && r >= 0 && r <= 7;
 }
 function inSqBounds(state, sq) {
@@ -107,22 +113,29 @@ function isAttacked(state, sq, by) {
   const f = col(sq);
   const r = row(sq);
   const eh = (state.eventHorizon || 0) > 0;
+  const dogSegs = state.dog && state.dog.active && state.dog.segments && state.dog.segments.length ? new Set(state.dog.segments.map((x) => x.sq)) : null;
   const dir = by === 'w' ? 1 : -1;
   for (const df of [-1, 1]) {
     const rr = r - dir;
     if (eh && (rr >= 4) !== (r >= 4)) continue;
+    const pSq = rr * 8 + (f + df);
+    if (dogSegs && dogSegs.has(pSq)) continue;
     const p = at(b, f + df, rr, state);
     if (active(p, by) && hasType(p, 'p')) return true;
   }
   for (const [df, dr] of KN) {
     const rr = r + dr;
     if (eh && (rr >= 4) !== (r >= 4)) continue;
+    const pSq = rr * 8 + (f + df);
+    if (dogSegs && dogSegs.has(pSq)) continue;
     const p = at(b, f + df, rr, state);
     if (active(p, by) && hasType(p, 'n')) return true;
   }
   for (const [df, dr] of KG) {
     const rr = r + dr;
     if (eh && (rr >= 4) !== (r >= 4)) continue;
+    const pSq = rr * 8 + (f + df);
+    if (dogSegs && dogSegs.has(pSq)) continue;
     const p = at(b, f + df, rr, state);
     if (active(p, by) && hasType(p, 'k')) return true;
   }
@@ -132,7 +145,9 @@ function isAttacked(state, sq, by) {
       let rr = r + dr;
       while (inBoardBounds(state, ff, rr)) {
         if (eh && (rr >= 4) !== (r >= 4)) break;
-        const p = b[rr * 8 + ff];
+        const targetSq = rr * 8 + ff;
+        if (dogSegs && dogSegs.has(targetSq)) break;
+        const p = b[targetSq];
         if (p) {
           if (active(p, by) && ([...types].some((t) => hasType(p, t)) || (hasType(p, 'k') && p.pink))) return true;
           break;
@@ -159,24 +174,31 @@ function pseudoMoves(state, c) {
   const b = state.board;
   const moves = [];
   const eh = (state.eventHorizon || 0) > 0;
+  const skill = state.activeSkill && state.activeSkill.color === c ? state.activeSkill.type : null;
+  const dogActive = state.dog && state.dog.active && state.dog.segments && state.dog.segments.length > 0;
+  const dogSegs = dogActive ? new Set(state.dog.segments.map((x) => x.sq)) : null;
+
   for (let s = 0; s < 64; s++) {
     if (!inSqBounds(state, s)) continue;
     const p = b[s];
     if (!p || p.c !== c || p.frozen > 0) continue;
+    if (dogSegs && dogSegs.has(s)) continue; // Trapped in DoG body, cannot move!
+
     const f = col(s);
     const r = row(s);
     const add = (to, extra) => {
       if (!inSqBounds(state, to)) return;
-      if (eh && !sameHalf(s, to)) return;
+      if (dogSegs && dogSegs.has(to) && (!extra || !extra.attackDog)) return;
+      if (eh && !sameHalf(s, to) && !(skill === 'jumpOver' && !b[to])) return;
       const pr = (extra && extra.promo) || null;
-      if (moves.some((m) => m.from === s && m.to === to && (m.promo || null) === pr)) return;
+      if (moves.some((m) => m.from === s && m.to === to && (m.promo || null) === pr && !!m.attackDog === !!(extra && extra.attackDog))) return;
       moves.push(Object.assign({ from: s, to }, extra));
     };
 
     if (hasType(p, 'p')) {
       const dir = c === 'w' ? 1 : -1;
-      const last = state.fourDim ? (c === 'w' ? 5 : 2) : (c === 'w' ? 7 : 0);
-      const start = state.fourDim ? -1 : (c === 'w' ? 1 : 6);
+      const last = c === 'w' ? 7 : 0;
+      const start = c === 'w' ? 1 : 6;
       const purePawn = !p.layers || p.layers.every((lt) => lt === 'p');
       const pushP = (to, extra) => {
         if (row(to) === last) {
@@ -191,23 +213,68 @@ function pseudoMoves(state, c) {
       };
       const r1 = r + dir;
       if (inBoardBounds(state, f, r1) && (!eh || (r1 >= 4) === (r >= 4))) {
-        if (!b[r1 * 8 + f]) {
-          pushP(r1 * 8 + f);
+        const straightSq = r1 * 8 + f;
+        if (dogSegs && dogSegs.has(straightSq)) {
+          add(straightSq, { attackDog: true });
+        } else if (!b[straightSq]) {
+          pushP(straightSq);
           const r2 = r + 2 * dir;
-          if (r === start && inBoardBounds(state, f, r2) && (!eh || (r2 >= 4) === (r >= 4)) && !b[r2 * 8 + f]) {
-            add(r2 * 8 + f, { double: true });
+          const twoSq = r2 * 8 + f;
+          if (r === start && inBoardBounds(state, f, r2) && (!eh || (r2 >= 4) === (r >= 4)) && !b[twoSq] && (!dogSegs || !dogSegs.has(twoSq))) {
+            add(twoSq, { double: true });
           }
         }
         for (const df of [-1, 1]) {
           const ff = f + df;
           if (!inBoardBounds(state, ff, r1)) continue;
           const t = r1 * 8 + ff;
-          const q = b[t];
-          if (q) {
-            if (canCapture(q, c)) pushP(t);
-          } else if (state.ep === t) {
-            const cap = b[r * 8 + ff];
-            if (cap && hasType(cap, 'p') && cap.c !== c && !(cap.shield > 0)) add(t, { ep: true });
+          if (dogSegs && dogSegs.has(t)) {
+            add(t, { attackDog: true });
+          } else {
+            const q = b[t];
+            if (q) {
+              if (canCapture(q, c)) pushP(t);
+            } else if (state.ep === t) {
+              const cap = b[r * 8 + ff];
+              if (cap && hasType(cap, 'p') && cap.c !== c && !(cap.shield > 0)) add(t, { ep: true });
+            }
+          }
+        }
+      }
+
+      // Quick Pawn: can capture backwards and diagonally backwards for 1 turn
+      if (skill === 'quickPawn') {
+        const rBack = r - dir;
+        if (inBoardBounds(state, f, rBack) && (!eh || (rBack >= 4) === (r >= 4))) {
+          const tStraight = rBack * 8 + f;
+          if (dogSegs && dogSegs.has(tStraight)) {
+            add(tStraight, { attackDog: true });
+          } else {
+            const qStraight = b[tStraight];
+            if (qStraight && canCapture(qStraight, c)) add(tStraight);
+          }
+          for (const df of [-1, 1]) {
+            const ff = f + df;
+            if (inBoardBounds(state, ff, rBack)) {
+              const tDiag = rBack * 8 + ff;
+              if (dogSegs && dogSegs.has(tDiag)) {
+                add(tDiag, { attackDog: true });
+              } else {
+                const qDiag = b[tDiag];
+                if (qDiag && canCapture(qDiag, c)) add(tDiag);
+              }
+            }
+          }
+        }
+      }
+
+      // Jump Over: pawns can jump 1 or 2 squares forward over pieces/EH to empty squares
+      if (skill === 'jumpOver') {
+        for (let step = 1; step <= 2; step++) {
+          const rStep = r + step * dir;
+          if (inBoardBounds(state, f, rStep)) {
+            const targetSq = rStep * 8 + f;
+            if (!b[targetSq] && (!dogSegs || !dogSegs.has(targetSq))) pushP(targetSq);
           }
         }
       }
@@ -215,9 +282,14 @@ function pseudoMoves(state, c) {
 
     if (hasType(p, 'n')) {
       for (const [df, dr] of KN) {
-        const q = at(b, f + df, r + dr, state);
-        if (q === undefined) continue;
-        if (!q || canCapture(q, c)) add((r + dr) * 8 + f + df);
+        if (!inBoardBounds(state, f + df, r + dr)) continue;
+        const targetSq = (r + dr) * 8 + f + df;
+        if (dogSegs && dogSegs.has(targetSq)) {
+          add(targetSq, { attackDog: true });
+          continue;
+        }
+        const q = b[targetSq];
+        if (!q || canCapture(q, c)) add(targetSq);
       }
     }
 
@@ -235,13 +307,33 @@ function pseudoMoves(state, c) {
       for (const [df, dr] of dirs) {
         let ff = f + df;
         let rr = r + dr;
+        let hasJumped = false;
         while (inBoardBounds(state, ff, rr)) {
-          if (eh && (rr >= 4) !== (r >= 4)) break;
-          const q = b[rr * 8 + ff];
-          if (!q) add(rr * 8 + ff);
-          else {
-            if (canCapture(q, c)) add(rr * 8 + ff);
+          const crossedEH = eh && (rr >= 4) !== (r >= 4);
+          if (crossedEH && skill !== 'jumpOver') break;
+          if (crossedEH) hasJumped = true;
+
+          const to = rr * 8 + ff;
+          if (dogSegs && dogSegs.has(to)) {
+            if (!hasType(p, 'k')) {
+              add(to, { attackDog: true });
+            }
+            break; // DoG blocks slider ray
+          }
+          const q = b[to];
+          if (!q) {
+            add(to);
+          } else if (q.c === c) {
             break;
+          } else {
+            if (!hasJumped && canCapture(q, c)) {
+              add(to);
+            }
+            if (skill === 'jumpOver') {
+              hasJumped = true;
+            } else {
+              break;
+            }
           }
           ff += df;
           rr += dr;
@@ -251,24 +343,41 @@ function pseudoMoves(state, c) {
     if (hasType(p, 'k')) {
       if (!p.pink) {
         for (const [df, dr] of KG) {
-          const q = at(b, f + df, r + dr, state);
-          if (q === undefined) continue;
-          if (!q || canCapture(q, c)) add((r + dr) * 8 + f + df);
+          if (!inBoardBounds(state, f + df, r + dr)) continue;
+          const targetSq = (r + dr) * 8 + f + df;
+          if (dogSegs && dogSegs.has(targetSq)) continue; // King cannot enter or attack DoG
+          const q = b[targetSq];
+          if (!q || canCapture(q, c)) add(targetSq);
+        }
+        if (skill === 'jumpOver') {
+          for (const [df, dr] of KG) {
+            const r2 = r + 2 * dr;
+            const f2 = f + 2 * df;
+            if (inBoardBounds(state, f2, r2)) {
+              const sq2 = r2 * 8 + f2;
+              if (!b[sq2] && (!dogSegs || !dogSegs.has(sq2))) add(sq2);
+            }
+          }
         }
       }
       // castling (disabled when 4D layered board is active)
       const home = c === 'w' ? 4 : 60;
-      if (!state.fourDim && s === home && !inCheck(state, c)) {
+      if (s === home && !inCheck(state, c)) {
         const o = opp(c);
         const rk = b[home + 3];
         if (state.castling[c + 'K'] && rk && rk.t === 'r' && rk.c === c && !(rk.frozen > 0) &&
-            !b[home + 1] && !b[home + 2] && !isAttacked(state, home + 1, o) && !isAttacked(state, home + 2, o)) {
+            !b[home + 1] && (!dogSegs || !dogSegs.has(home + 1)) &&
+            !b[home + 2] && (!dogSegs || !dogSegs.has(home + 2)) &&
+            !isAttacked(state, home + 1, o) && !isAttacked(state, home + 2, o)) {
           removeDup(moves, s, home + 2);
           add(home + 2, { castle: 'K' });
         }
         const rq = b[home - 4];
         if (state.castling[c + 'Q'] && rq && rq.t === 'r' && rq.c === c && !(rq.frozen > 0) &&
-            !b[home - 1] && !b[home - 2] && !b[home - 3] && !isAttacked(state, home - 1, o) && !isAttacked(state, home - 2, o)) {
+            !b[home - 1] && (!dogSegs || !dogSegs.has(home - 1)) &&
+            !b[home - 2] && (!dogSegs || !dogSegs.has(home - 2)) &&
+            !b[home - 3] && (!dogSegs || !dogSegs.has(home - 3)) &&
+            !isAttacked(state, home - 1, o) && !isAttacked(state, home - 2, o)) {
           removeDup(moves, s, home - 2);
           add(home - 2, { castle: 'Q' });
         }
@@ -311,12 +420,58 @@ function recordLost(state, p) {
   }
 }
 
+function dogDamage(p) {
+  if (!p) return 0;
+  if (hasType(p, 'k')) return 0;
+  if (hasType(p, 'q')) return 10;
+  if (hasType(p, 'r') || hasType(p, 'b')) return 5;
+  if (hasType(p, 'n')) return 3;
+  if (hasType(p, 'p')) return 1;
+  return 0;
+}
+
 // Mutates state. Returns info about what happened.
 function makeMove(state, m) {
   const b = state.board;
   const p = b[m.from];
   const c = p.c;
   const origType = p.t;
+
+  if (m.attackDog) {
+    const dmg = dogDamage(p);
+    let killed = false;
+    if (state.dog && state.dog.active) {
+      state.dog.hp = Math.max(0, state.dog.hp - dmg);
+      killed = state.dog.hp <= 0;
+      if (killed) {
+        state.dog.active = false;
+        state.dog.phase = 'dead';
+        state.dog.segments = [];
+        state.dog.telegraph = null;
+      }
+      state.dog.lastHit = {
+        dmg,
+        sq: m.to,
+        from: m.from,
+        color: c,
+        piece: origType,
+        dogHp: state.dog.hp,
+        killed,
+      };
+    }
+    state.halfmove = 0;
+    return {
+      captured: null,
+      exploded: false,
+      kingCaptured: null,
+      castle: false,
+      promo: null,
+      shotgun: null,
+      attackDog: true,
+      dogHit: state.dog ? state.dog.lastHit : null,
+    };
+  }
+
   const info = { captured: null, exploded: false, kingCaptured: null, castle: !!m.castle, promo: m.promo || null, shotgun: null };
   let cap = b[m.to];
   if (m.ep) {
@@ -441,7 +596,8 @@ function posKey(state) {
     k += p ? (p.c === 'w' ? p.t.toUpperCase() : p.t) + lStr + (p.pink ? '!' : '') + (p.shotgun ? 'S' : '') + (p.dmg ? p.dmg : '') : '.';
   }
   const cs = state.castling;
-  return k + state.turn + (cs.wK ? 'K' : '') + (cs.wQ ? 'Q' : '') + (cs.bK ? 'k' : '') + (cs.bQ ? 'q' : '') + (state.ep ?? '-') + (state.eventHorizon > 0 ? ':EH' : '') + ((state.fourDim || 0) > 0 ? ':4D' : '');
+  const dogK = state.dog && state.dog.active ? `:D${state.dog.hp},${state.dog.turnsUntilAttack}` : '';
+  return k + state.turn + (cs.wK ? 'K' : '') + (cs.wQ ? 'Q' : '') + (cs.bK ? 'k' : '') + (cs.bQ ? 'q' : '') + (state.ep ?? '-') + (state.eventHorizon > 0 ? ':EH' : '') + dogK;
 }
 
 function insufficientMaterial(state) {
@@ -467,6 +623,9 @@ function insufficientMaterial(state) {
 // SAN without check suffix. `legal` = legal moves for the mover in `state` (before the move).
 function toSan(state, m, legal) {
   const p = state.board[m.from];
+  if (m.attackDog) {
+    return (p ? (p.t === 'p' ? FILES[col(m.from)] : p.t.toUpperCase()) : '') + 'xDoG(' + sqName(m.to) + ')';
+  }
   if (m.castle) return m.castle === 'K' ? 'O-O' : 'O-O-O';
   const capture = !!state.board[m.to] || !!m.ep;
   if (p.t === 'p' && (!p.layers || p.layers.every((lt) => lt === 'p'))) {
@@ -496,5 +655,5 @@ function perft(state, depth) {
 
 module.exports = {
   FILES, row, col, sqName, opp, VALUES, PIECE_MAX_HP, maxHp, DIRS_8, inBoardBounds, inSqBounds, hasType, recordLost, isLastKingStanding, mkPiece, initialState, cloneState, isAttacked, kingSq, inCheck,
-  pseudoMoves, legalMoves, makeMove, updateCastling, posKey, insufficientMaterial, toSan, perft,
+  pseudoMoves, legalMoves, makeMove, updateCastling, posKey, insufficientMaterial, toSan, perft, dogDamage,
 };
