@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "express": "^4.21.0",
+    "mongodb": "^7.8.0",
     "socket.io": "^4.8.0"
   }
 }
